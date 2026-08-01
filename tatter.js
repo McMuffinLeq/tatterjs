@@ -385,6 +385,11 @@
     this.mesh = new THREE.Mesh(this.geometry, this.material);
     this.mesh.castShadow = opts.castShadow !== false;
     this.mesh.receiveShadow = opts.receiveShadow !== false;
+    // NOTE: cloth folds onto itself constantly. If it receives its own
+    // shadow with no bias, you'll see a fine rippled/striped artifact
+    // under directional light ("shadow acne"). Fix this on your light,
+    // not here: light.shadow.bias = -0.002 (and/or
+    // light.shadow.normalBias = 0.02) typically clears it up.
 
     syncGeometry(this.cloth, this.mesh);
   }
