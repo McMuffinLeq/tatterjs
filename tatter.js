@@ -445,7 +445,7 @@
   // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
   Cloth.prototype._resolveSphere = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = 0.06, friction = this.collisionFriction;
+    var skin = this.collisionSkin, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -485,7 +485,7 @@
   // axis-aligned to Y (upright), pos is the center ----
   Cloth.prototype._resolveCylinder = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = 0.06, friction = this.collisionFriction;
+    var skin = this.collisionSkin, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -559,7 +559,7 @@
   // at pos.y + height/2 ----
   Cloth.prototype._resolveCone = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = 0.06, friction = this.collisionFriction;
+    var skin = this.collisionSkin, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var baseR = col.radius, h = col.height;
@@ -661,9 +661,19 @@
   // on a collider; lower = slides off more readily
   Cloth.prototype.collisionFriction = 0.35;
 
+  /** Collision skin margin — extra buffer distance kept between cloth
+   *  points and collider surfaces. This is the same fix Blender calls
+   *  "Min Distance" on its cloth collision panel: raising it is the
+   *  fastest way to stop visible corner/edge clipping, at the cost of
+   *  cloth appearing to float slightly off the surface instead of
+   *  sitting flush against it. Default matches the old hardcoded 0.06.
+   *  Set via cloth.collisionSkin = 0.1 (or flag.cloth.collisionSkin on
+   *  a TatterMesh) if corners still clip after the geometry-side fix. */
+  Cloth.prototype.collisionSkin = 0.06;
+
   Cloth.prototype._resolveBox = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = 0.06;
+    var skin = this.collisionSkin;
     var friction = this.collisionFriction;
 
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
