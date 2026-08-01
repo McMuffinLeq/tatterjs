@@ -375,8 +375,9 @@
         color: opts.color != null ? opts.color : 0xffffff,
         map: opts.map || null,
         side: THREE.DoubleSide,
-        roughness: opts.roughness != null ? opts.roughness : 0.8,
-        metalness: opts.metalness != null ? opts.metalness : 0.05
+        roughness: opts.roughness != null ? opts.roughness : 0.65,
+        metalness: opts.metalness != null ? opts.metalness : 0.05,
+        flatShading: false
       });
     }
     this.material = material;
