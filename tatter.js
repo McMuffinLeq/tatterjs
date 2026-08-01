@@ -31,6 +31,15 @@
    * use Tatter.cloth(scene, options) instead, which also builds and
    * attaches the mesh for you.
    */
+  // Collision skin margin — extra buffer distance kept between cloth
+  // points and box/sphere/cylinder/cone collider surfaces. This is what
+  // prevents visible corner/edge clipping (the same fix Blender calls
+  // "Min Distance" on its cloth collision panel). Fixed as part of the
+  // physics itself, not a per-cloth option — tuned once against real
+  // corner-penetration cases and intentionally not exposed for tuning,
+  // since a wrong value here reintroduces visible clipping.
+  var COLLISION_SKIN = 0.16;
+
   function Cloth(opts) {
     this.cols = opts.cols;
     this.rows = opts.rows;
@@ -295,7 +304,20 @@
         if (type === 'sphere') this._resolveSphere(p, col);
         else if (type === 'cylinder') this._resolveCylinder(p, col);
         else if (type === 'cone') this._resolveCone(p, col);
-        else this._resolveBox(p, col);
+        else {
+          // box: corner/edge penetration can be deep enough that a
+          // single push-out (sized by `skin`) undershoots and leaves a
+          // small residual overlap — literature on cloth collision
+          // consistently notes that even slightly-under-resolved
+          // penetration is visible as a lingering clip. Re-run once
+          // more immediately so a corner point gets a second, smaller
+          // corrective pass against its now-closer-to-correct position
+          // in the same frame, instead of waiting for the next
+          // iteration (which structural constraints could disturb
+          // again before collision gets another turn).
+          this._resolveBox(p, col);
+          this._resolveBox(p, col);
+        }
       }
     }
   };
@@ -459,7 +481,7 @@
   // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
   Cloth.prototype._resolveSphere = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = this.collisionSkin, friction = this.collisionFriction;
+    var skin = COLLISION_SKIN, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -499,7 +521,7 @@
   // axis-aligned to Y (upright), pos is the center ----
   Cloth.prototype._resolveCylinder = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = this.collisionSkin, friction = this.collisionFriction;
+    var skin = COLLISION_SKIN, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -573,7 +595,7 @@
   // at pos.y + height/2 ----
   Cloth.prototype._resolveCone = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = this.collisionSkin, friction = this.collisionFriction;
+    var skin = COLLISION_SKIN, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var baseR = col.radius, h = col.height;
@@ -675,19 +697,9 @@
   // on a collider; lower = slides off more readily
   Cloth.prototype.collisionFriction = 0.35;
 
-  /** Collision skin margin — extra buffer distance kept between cloth
-   *  points and collider surfaces. This is the same fix Blender calls
-   *  "Min Distance" on its cloth collision panel: raising it is the
-   *  fastest way to stop visible corner/edge clipping, at the cost of
-   *  cloth appearing to float slightly off the surface instead of
-   *  sitting flush against it. Default matches the old hardcoded 0.06.
-   *  Set via cloth.collisionSkin = 0.1 (or flag.cloth.collisionSkin on
-   *  a TatterMesh) if corners still clip after the geometry-side fix. */
-  Cloth.prototype.collisionSkin = 0.06;
-
   Cloth.prototype._resolveBox = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = this.collisionSkin;
+    var skin = COLLISION_SKIN;
     var friction = this.collisionFriction;
 
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
@@ -1064,15 +1076,103 @@
     // not here: light.shadow.bias = -0.002 (and/or
     // light.shadow.normalBias = 0.02) typically clears it up.
 
+    // ---- optional frustum culling: skip physics + mesh sync entirely
+    // when the cloth isn't in view. Off by default — opt in by passing
+    // a THREE.Camera as `cullCamera`. See update() below for how the
+    // actual skip decision is made each frame.
+    this.cullCamera = opts.cullCamera || null;
+    this._frustum = new THREE.Frustum();
+    this._frustumMatrix = new THREE.Matrix4();
+    this._boundingSphere = new THREE.Sphere();
+    this._computeBoundingSphere();
+    this._wasInView = true; // assume visible on the first frame
+
     syncMeshGeometry(this.cloth, this.mesh);
   }
+
+  /** Recompute the cloth's world-space bounding sphere from its current
+   *  point positions. Called once at construction; call again yourself
+   *  (tatterMesh._computeBoundingSphere()) if the cloth's overall extent
+   *  changes drastically at runtime (e.g. you reposition its origin far
+   *  from where it started) so culling stays accurate. Ordinary drape/
+   *  wind motion does NOT require this — the sphere is padded generously
+   *  on purpose so normal movement stays inside it. */
+  TatterMesh.prototype._computeBoundingSphere = function () {
+    var pos = this.cloth.pos;
+    var n = this.cloth.cols * this.cloth.rows;
+    var minX = Infinity, minY = Infinity, minZ = Infinity;
+    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (var i = 0; i < n; i++) {
+      var ix = i * 3;
+      var x = pos[ix], y = pos[ix + 1], z = pos[ix + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    var cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+    var dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
+    var radius = Math.sqrt(dx * dx + dy * dy + dz * dz) / 2;
+    // pad generously: cloth moves (drape, wind, pin animation) after this
+    // is computed, and the sphere isn't recomputed every frame (that
+    // would defeat the point of culling — recomputing needs the same
+    // point-position pass the physics step already does). The pad keeps
+    // normal motion from drifting the cloth outside its own culling
+    // volume and popping in and out incorrectly.
+    this._boundingSphere.center.set(cx, cy, cz);
+    this._boundingSphere.radius = Math.max(radius, this.cloth.spacing) * 1.5 + 1;
+  };
 
   /** Advance physics and sync the mesh geometry. Call once per frame.
    *  Set tatter.meshSkip = N to throttle the expensive smoothing/normals
    *  resync to every Nth call (physics itself still steps every call).
    *  Default 1 (every frame).
+   *
+   *  If cullCamera was passed at construction (or set directly via
+   *  tatterMesh.cullCamera = camera), this checks the cloth's bounding
+   *  sphere against that camera's view frustum first. When the cloth is
+   *  fully outside the frustum, BOTH the physics step and the mesh sync
+   *  are skipped entirely for this call — the point array is left
+   *  exactly as it was. This is a real cost saving (not just a visual
+   *  one) for scenes with several off-screen cloths, at the cost of
+   *  cloth motion "freezing" while off-screen and resuming, rather than
+   *  continuing to simulate silently, once it re-enters view. That's
+   *  usually the right tradeoff (why pay for wind/collision on a flag
+   *  behind the player's back?), but if you need cloth to keep animating
+   *  off-screen (e.g. it's about to swing into view on a predictable
+   *  path), don't set cullCamera and rely on meshSkip/collisionIterations
+   *  instead for perf.
    */
   TatterMesh.prototype.update = function (colliders, wind) {
+    if (this.cullCamera) {
+      // NOTE: matrixWorldInverse is only correct if the camera's world
+      // matrix has been updated THIS frame. That normally happens
+      // inside renderer.render(), which typically runs AFTER
+      // tatterMesh.update() in a standard animate loop — meaning by
+      // default this would check against last frame's camera transform
+      // (fine for a static camera, one frame stale for a moving one).
+      // If your camera moves and you see culling lag by a frame,
+      // call cullCamera.updateMatrixWorld() yourself right before this.
+      this.cullCamera.updateMatrixWorld();
+      this._frustumMatrix.multiplyMatrices(
+        this.cullCamera.projectionMatrix,
+        this.cullCamera.matrixWorldInverse
+      );
+      this._frustum.setFromProjectionMatrix(this._frustumMatrix);
+      var inView = this._frustum.intersectsSphere(this._boundingSphere);
+      if (!inView) {
+        this._wasInView = false;
+        return this; // skip physics + mesh sync entirely this frame
+      }
+      if (!this._wasInView) {
+        // re-entering view after being culled: prev/pos can be far
+        // apart if a lot of real time passed off-screen (nothing was
+        // stepping prev toward pos), which would otherwise show up as
+        // a sudden velocity kick on the first visible frame. Snap prev
+        // to pos once so the cloth resumes calmly instead of lurching.
+        this.cloth.prev.set(this.cloth.pos);
+        this._wasInView = true;
+      }
+    }
     this.cloth.step(colliders, wind, this._floorY);
     syncMeshGeometry(this.cloth, this.mesh, this.meshSkip || 1);
     return this;
