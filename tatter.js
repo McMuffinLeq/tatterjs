@@ -306,6 +306,107 @@
 
   // ---- Three.js mesh binding ----
 
+  // ---- optional smoothing: render at higher resolution than the physics
+  // grid, interpolating the coarse simulated points with Catmull-Rom
+  // splines. Physics stays cheap; the visible mesh looks dense and smooth.
+
+  function catmullRom1D(p0, p1, p2, p3, t) {
+    var t2 = t * t, t3 = t2 * t;
+    return 0.5 * (
+      (2 * p1) +
+      (-p0 + p2) * t +
+      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+      (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+    );
+  }
+
+  // sample the coarse cloth grid at fractional (gx, gy) grid coordinates
+  function sampleCloth(cloth, gx, gy, outIdx, out) {
+    var cols = cloth.cols, rows = cloth.rows, pos = cloth.pos;
+    var x0 = Math.floor(gx), y0 = Math.floor(gy);
+    var tx = gx - x0, ty = gy - y0;
+
+    function clampX(x) { return x < 0 ? 0 : (x > cols - 1 ? cols - 1 : x); }
+    function clampY(y) { return y < 0 ? 0 : (y > rows - 1 ? rows - 1 : y); }
+
+    var rowVals = [0, 0, 0, 0]; // per-axis interpolated rows, filled 3x below
+    for (var axis = 0; axis < 3; axis++) {
+      var cx = [];
+      for (var iy = -1; iy <= 2; iy++) {
+        var yy = clampY(y0 + iy);
+        var vals = [];
+        for (var ix = -1; ix <= 2; ix++) {
+          var xx = clampX(x0 + ix);
+          vals.push(pos[cloth.idx(xx, yy) * 3 + axis]);
+        }
+        cx.push(catmullRom1D(vals[0], vals[1], vals[2], vals[3], tx));
+      }
+      out[outIdx + axis] = catmullRom1D(cx[0], cx[1], cx[2], cx[3], ty);
+    }
+  }
+
+  function buildSmoothGeometry(THREE, cloth, factor) {
+    var geo = new THREE.BufferGeometry();
+    var subCols = (cloth.cols - 1) * factor + 1;
+    var subRows = (cloth.rows - 1) * factor + 1;
+    var n = subCols * subRows;
+    var positions = new Float32Array(n * 3);
+    var uvs = new Float32Array(n * 2);
+    var indices = [];
+
+    for (var y = 0; y < subRows; y++) {
+      for (var x = 0; x < subCols; x++) {
+        var i = y * subCols + x;
+        uvs[i * 2] = x / (subCols - 1);
+        uvs[i * 2 + 1] = y / (subRows - 1);
+      }
+    }
+
+    for (var yy = 0; yy < subRows - 1; yy++) {
+      for (var xx = 0; xx < subCols - 1; xx++) {
+        var a = yy * subCols + xx, b = yy * subCols + (xx + 1),
+            c = (yy + 1) * subCols + xx, d = (yy + 1) * subCols + (xx + 1);
+        indices.push(a, c, b);
+        indices.push(b, c, d);
+      }
+    }
+
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+    geo._subCols = subCols;
+    geo._subRows = subRows;
+    geo._smoothFactor = factor;
+    return geo;
+  }
+
+  function syncSmoothGeometry(cloth, mesh) {
+    var geo = mesh.geometry;
+    var subCols = geo._subCols, subRows = geo._subRows, factor = geo._smoothFactor;
+    var attr = geo.getAttribute('position');
+    var arr = attr.array;
+
+    for (var y = 0; y < subRows; y++) {
+      var gy = y / factor;
+      for (var x = 0; x < subCols; x++) {
+        var gx = x / factor;
+        sampleCloth(cloth, gx, gy, (y * subCols + x) * 3, arr);
+      }
+    }
+
+    attr.needsUpdate = true;
+    geo.computeVertexNormals();
+  }
+
+  function syncMeshGeometry(cloth, mesh) {
+    if (mesh.geometry._smoothFactor) {
+      syncSmoothGeometry(cloth, mesh);
+    } else {
+      syncGeometry(cloth, mesh);
+    }
+  }
+
   function buildGeometry(THREE, cloth) {
     var geo = new THREE.BufferGeometry();
     var n = cloth.cols * cloth.rows;
@@ -367,7 +468,14 @@
       pinEvery: opts.pinEvery
     });
 
-    this.geometry = buildGeometry(THREE, this.cloth);
+    // smooth: false (default) renders at the physics grid resolution.
+    // smooth: N (integer >= 2) renders a Catmull-Rom-interpolated mesh
+    // at N times the density, so the surface looks smooth and dense
+    // without making the physics simulation itself more expensive.
+    this.smoothFactor = opts.smooth && opts.smooth > 1 ? Math.floor(opts.smooth) : 0;
+    this.geometry = this.smoothFactor
+      ? buildSmoothGeometry(THREE, this.cloth, this.smoothFactor)
+      : buildGeometry(THREE, this.cloth);
 
     var material = opts.material;
     if (!material) {
@@ -391,14 +499,14 @@
     // not here: light.shadow.bias = -0.002 (and/or
     // light.shadow.normalBias = 0.02) typically clears it up.
 
-    syncGeometry(this.cloth, this.mesh);
+    syncMeshGeometry(this.cloth, this.mesh);
   }
 
   /** Advance physics and sync the mesh geometry. Call once per frame. */
   TatterMesh.prototype.update = function (colliders, wind) {
     this.cloth.step(colliders, wind);
     if (this._floorY != null) this.cloth.clampFloor(this._floorY);
-    syncGeometry(this.cloth, this.mesh);
+    syncMeshGeometry(this.cloth, this.mesh);
     return this;
   };
 
