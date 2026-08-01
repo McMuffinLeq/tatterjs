@@ -399,7 +399,17 @@
     geo.computeVertexNormals();
   }
 
-  function syncMeshGeometry(cloth, mesh) {
+  function syncMeshGeometry(cloth, mesh, skip) {
+    // skip: recompute the visible mesh only every Nth call (default 1 = every
+    // frame). Physics still steps every call — only the expensive smoothing
+    // resample + normal recalculation is throttled. Cloth moves slowly
+    // enough that skip 2-3 is visually indistinguishable but roughly
+    // halves/thirds the CPU cost of the sync step, which is usually the
+    // actual bottleneck on mobile, not the physics itself.
+    skip = skip || 1;
+    mesh._tatterFrame = (mesh._tatterFrame || 0) + 1;
+    if (skip > 1 && (mesh._tatterFrame % skip) !== 0) return;
+
     if (mesh.geometry._smoothFactor) {
       syncSmoothGeometry(cloth, mesh);
     } else {
@@ -454,8 +464,8 @@
     this.THREE = THREE;
 
     this.cloth = new Cloth({
-      cols: opts.cols || 16,
-      rows: opts.rows || 16,
+      cols: opts.cols || 24,
+      rows: opts.rows || 24,
       spacing: opts.spacing != null ? opts.spacing : 0.25,
       origin: opts.origin || { x: 0, y: 0, z: 0 },
       gravity: opts.gravity,
@@ -468,11 +478,15 @@
       pinEvery: opts.pinEvery
     });
 
-    // smooth: false (default) renders at the physics grid resolution.
     // smooth: N (integer >= 2) renders a Catmull-Rom-interpolated mesh
     // at N times the density, so the surface looks smooth and dense
     // without making the physics simulation itself more expensive.
-    this.smoothFactor = opts.smooth && opts.smooth > 1 ? Math.floor(opts.smooth) : 0;
+    // Defaults ON at 3x so cloth looks smooth even if the caller
+    // doesn't pass the option. Pass smooth: false or smooth: 1 to
+    // render at raw physics-grid resolution instead.
+    this.smoothFactor = (opts.smooth === false || opts.smooth === 1)
+      ? 0
+      : Math.floor(opts.smooth && opts.smooth > 1 ? opts.smooth : 3);
     this.geometry = this.smoothFactor
       ? buildSmoothGeometry(THREE, this.cloth, this.smoothFactor)
       : buildGeometry(THREE, this.cloth);
@@ -487,12 +501,23 @@
         metalness: opts.metalness != null ? opts.metalness : 0.05,
         flatShading: false
       });
+    } else if ('flatShading' in material) {
+      // shade-smooth guarantee: even a caller-supplied material won't
+      // render faceted, since normals are always smoothed below anyway
+      material.flatShading = false;
+      material.needsUpdate = true;
     }
     this.material = material;
 
     this.mesh = new THREE.Mesh(this.geometry, this.material);
     this.mesh.castShadow = opts.castShadow !== false;
     this.mesh.receiveShadow = opts.receiveShadow !== false;
+    // Throttles the smoothing resample + normal recompute (the expensive
+    // per-frame CPU work) to every Nth update() call. Physics still steps
+    // every call regardless. Default 2 — halves that cost with motion
+    // still reading as smooth. Set to 1 for max fidelity, higher (3-4) if
+    // it's still choppy on your device.
+    this.meshSkip = opts.meshSkip != null ? opts.meshSkip : 2;
     // NOTE: cloth folds onto itself constantly. If it receives its own
     // shadow with no bias, you'll see a fine rippled/striped artifact
     // under directional light ("shadow acne"). Fix this on your light,
@@ -502,11 +527,15 @@
     syncMeshGeometry(this.cloth, this.mesh);
   }
 
-  /** Advance physics and sync the mesh geometry. Call once per frame. */
+  /** Advance physics and sync the mesh geometry. Call once per frame.
+   *  Pass a truthy 3rd arg... actually just set tatter.meshSkip = N to
+   *  throttle the expensive smoothing/normals resync to every Nth call
+   *  (physics itself still steps every call). Default 1 (every frame).
+   */
   TatterMesh.prototype.update = function (colliders, wind) {
     this.cloth.step(colliders, wind);
     if (this._floorY != null) this.cloth.clampFloor(this._floorY);
-    syncMeshGeometry(this.cloth, this.mesh);
+    syncMeshGeometry(this.cloth, this.mesh, this.meshSkip || 1);
     return this;
   };
 
