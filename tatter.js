@@ -183,114 +183,250 @@
     }
   };
 
+  Cloth.prototype._resolveColliders = function (colliders) {
+    var n = this.cols * this.rows;
+    var pos = this.pos, prev = this.prev, pinned = this.pinned;
+
+    for (var p = 0; p < n; p++) {
+      if (pinned[p]) continue;
+      for (var cIdx = 0; cIdx < colliders.length; cIdx++) {
+        var col = colliders[cIdx];
+        var type = col.type || 'box';
+        if (type === 'sphere') this._resolveSphere(p, col);
+        else if (type === 'cylinder') this._resolveCylinder(p, col);
+        else if (type === 'cone') this._resolveCone(p, col);
+        else this._resolveBox(p, col);
+      }
+    }
+  };
+
+  // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
+  Cloth.prototype._resolveSphere = function (p, col) {
+    var pos = this.pos, prev = this.prev;
+    var skin = 0.06, friction = this.collisionFriction;
+    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
+    var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
+    var r = col.radius + skin;
+
+    var lx = pos[pxI] - cx, ly = pos[pyI] - cy, lz = pos[pzI] - cz;
+    var distSq = lx * lx + ly * ly + lz * lz;
+    if (distSq >= r * r || distSq < 1e-12) return;
+
+    var dist = Math.sqrt(distSq);
+    var nx = lx / dist, ny = ly / dist, nz = lz / dist;
+    pos[pxI] = cx + nx * r;
+    pos[pyI] = cy + ny * r;
+    pos[pzI] = cz + nz * r;
+
+    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
+  };
+
+  // ---- cylinder collider: { type:'cylinder', pos:{x,y,z}, radius, height }
+  // axis-aligned to Y (upright), pos is the center ----
+  Cloth.prototype._resolveCylinder = function (p, col) {
+    var pos = this.pos;
+    var skin = 0.06, friction = this.collisionFriction;
+    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
+    var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
+    var r = col.radius + skin;
+    var halfH = col.height / 2 + skin;
+
+    var lx = pos[pxI] - cx, ly = pos[pyI] - cy, lz = pos[pzI] - cz;
+    if (Math.abs(ly) >= halfH) return;
+
+    var radialSq = lx * lx + lz * lz;
+    if (radialSq >= r * r || radialSq < 1e-12) return;
+
+    var radial = Math.sqrt(radialSq);
+    var overRadial = r - radial;
+    var overTop = halfH - Math.abs(ly);
+
+    var nx = 0, ny = 0, nz = 0;
+    if (overTop < overRadial) {
+      ny = ly < 0 ? -1 : 1;
+      pos[pyI] = cy + ny * halfH;
+    } else {
+      nx = lx / radial; nz = lz / radial;
+      pos[pxI] = cx + nx * r;
+      pos[pzI] = cz + nz * r;
+    }
+
+    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
+  };
+
+  // ---- cone collider: { type:'cone', pos:{x,y,z}, radius, height }
+  // apex points up: base (widest, radius) at pos.y - height/2, apex (point)
+  // at pos.y + height/2 ----
+  Cloth.prototype._resolveCone = function (p, col) {
+    var pos = this.pos;
+    var skin = 0.06, friction = this.collisionFriction;
+    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
+    var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
+    var baseR = col.radius, h = col.height;
+    var baseY = cy - h / 2, apexY = cy + h / 2;
+
+    var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
+    if (py < baseY - skin || py > apexY + skin) return;
+
+    // radius of the cone's surface at this height (0 at apex, baseR at base)
+    var t = Math.max(0, Math.min(1, (apexY - py) / h)); // 1 at base, 0 at apex
+    var rAtHeight = baseR * t + skin;
+
+    var lx = px - cx, lz = pz - cz;
+    var radialSq = lx * lx + lz * lz;
+    if (radialSq >= rAtHeight * rAtHeight || radialSq < 1e-12) return;
+
+    var radial = Math.sqrt(radialSq);
+    var nxR = lx / radial, nzR = lz / radial;
+
+    // slant normal: combine outward radial direction with the cone's
+    // slope so cloth is pushed away from the slanted surface, not just
+    // straight out radially (which would look wrong on a pointed cone)
+    var slope = baseR / h;
+    var nlen = Math.sqrt(1 + slope * slope);
+    var nx = nxR / nlen, nz = nzR / nlen, ny = slope / nlen;
+
+    pos[pxI] = cx + nxR * rAtHeight;
+    pos[pzI] = cz + nzR * rAtHeight;
+
+    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
+  };
+
+  // shared: split velocity into normal/tangential, kill normal (no bounce),
+  // damp tangential (lets cloth slide/slump off instead of sticking)
+  Cloth.prototype._dampTangential = function (pxI, pyI, pzI, nx, ny, nz, friction) {
+    var pos = this.pos, prev = this.prev;
+    var vx = pos[pxI] - prev[pxI];
+    var vy = pos[pyI] - prev[pyI];
+    var vz = pos[pzI] - prev[pzI];
+    var vn = vx * nx + vy * ny + vz * nz;
+    var tx = vx - vn * nx;
+    var ty = vy - vn * ny;
+    var tz = vz - vn * nz;
+    prev[pxI] = pos[pxI] - tx * friction;
+    prev[pyI] = pos[pyI] - ty * friction;
+    prev[pzI] = pos[pzI] - tz * friction;
+  };
+
   // friction applied to tangential (in-surface) velocity when a point rests
   // on a collider; lower = slides off more readily
   Cloth.prototype.collisionFriction = 0.35;
 
-  Cloth.prototype._resolveColliders = function (colliders) {
-    var n = this.cols * this.rows;
-    var pos = this.pos, prev = this.prev, pinned = this.pinned;
+  Cloth.prototype._resolveBox = function (p, col) {
+    var pos = this.pos, prev = this.prev;
     var skin = 0.06;
     var friction = this.collisionFriction;
 
-    for (var p = 0; p < n; p++) {
-      if (pinned[p]) continue;
-      var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
+    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
 
-      for (var cIdx = 0; cIdx < colliders.length; cIdx++) {
-        var col = colliders[cIdx];
-        var half = col.half;
-        var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
+    var half = col.half;
+    var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
 
-        var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
-        var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
+    var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
+    var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
 
-        var hx = half.x + skin, hy = half.y + skin, hz = half.z + skin;
+    var hx = half.x + skin, hy = half.y + skin, hz = half.z + skin;
 
-        var lx = px - cx, ly = py - cy, lz = pz - cz;
-        var inside = Math.abs(lx) < hx && Math.abs(ly) < hy && Math.abs(lz) < hz;
+    var lx = px - cx, ly = py - cy, lz = pz - cz;
+    var inside = Math.abs(lx) < hx && Math.abs(ly) < hy && Math.abs(lz) < hz;
 
-        // if not resolved as "inside" this frame, still check whether the
-        // point tunneled straight through the box between prev and pos
-        // (fast wind/gravity/collider motion can skip a thin box entirely
-        // in one step, or skin-boundary rounding can leave a point sitting
-        // exactly on the edge). Always run a swept AABB test against the
-        // prev->pos segment rather than gating on a "was outside" check,
-        // since that boundary comparison is float-precision-fragile.
-        if (!inside) {
-          var plx = ppx - cx, ply = ppy - cy, plz = ppz - cz;
-          var dx = px - ppx, dy = py - ppy, dz = pz - ppz;
-          var tmin = 0, tmax = 1;
-          var axes = [[plx, dx, hx], [ply, dy, hy], [plz, dz, hz]];
-          var hit = true;
-          for (var ai = 0; ai < 3; ai++) {
-            var o = axes[ai][0], d = axes[ai][1], h = axes[ai][2];
-            if (Math.abs(d) < 1e-8) {
-              if (o < -h || o > h) { hit = false; break; }
-            } else {
-              var t1 = (-h - o) / d, t2 = (h - o) / d;
-              if (t1 > t2) { var tmp = t1; t1 = t2; t2 = tmp; }
-              if (t1 > tmin) tmin = t1;
-              if (t2 < tmax) tmax = t2;
-              if (tmin > tmax) { hit = false; break; }
-            }
-          }
-          if (hit) {
-            // pull the point back to just before it entered the box,
-            // then let normal resolution below push it out from there
-            px = ppx + dx * tmin; py = ppy + dy * tmin; pz = ppz + dz * tmin;
-            pos[pxI] = px; pos[pyI] = py; pos[pzI] = pz;
-            lx = px - cx; ly = py - cy; lz = pz - cz;
-            inside = true;
-          }
-        }
-
-        if (!inside) continue;
-
-        var ox = hx - Math.abs(lx);
-        var oy = hy - Math.abs(ly);
-        var oz = hz - Math.abs(lz);
-
-        // resting on top but near the edge (within ~15% of the far side)?
-        // taper the vertical support so the point tips and slides off
-        // instead of getting a hard clamp all the way to the corner.
-        var onTop = oy < oz && oy < ox && ly > 0;
-        if (onTop) {
-          var edgeMarginX = half.x * 0.15;
-          var edgeMarginZ = half.z * 0.15;
-          var pastEdge = Math.abs(lx) > half.x - edgeMarginX || Math.abs(lz) > half.z - edgeMarginZ;
-          if (pastEdge) continue; // no support here — try next collider / let gravity take it
-        }
-
-        var nx = 0, ny = 0, nz = 0;
-        if (ox < oy && ox < oz) {
-          nx = lx < 0 ? -1 : 1;
-          pos[pxI] = cx + nx * hx;
-        } else if (oy < oz) {
-          ny = ly < 0 ? -1 : 1;
-          pos[pyI] = cy + ny * hy;
+    // if not resolved as "inside" this frame, still check whether the
+    // point tunneled straight through the box between prev and pos
+    // (fast wind/gravity/collider motion can skip a thin box entirely
+    // in one step, or skin-boundary rounding can leave a point sitting
+    // exactly on the edge). Always run a swept AABB test against the
+    // prev->pos segment rather than gating on a "was outside" check,
+    // since that boundary comparison is float-precision-fragile.
+    if (!inside) {
+      var plx = ppx - cx, ply = ppy - cy, plz = ppz - cz;
+      var dx = px - ppx, dy = py - ppy, dz = pz - ppz;
+      var tmin = 0, tmax = 1;
+      var axes = [[plx, dx, hx], [ply, dy, hy], [plz, dz, hz]];
+      var hit = true;
+      for (var ai = 0; ai < 3; ai++) {
+        var o = axes[ai][0], d = axes[ai][1], h = axes[ai][2];
+        if (Math.abs(d) < 1e-8) {
+          if (o < -h || o > h) { hit = false; break; }
         } else {
-          nz = lz < 0 ? -1 : 1;
-          pos[pzI] = cz + nz * hz;
+          var t1 = (-h - o) / d, t2 = (h - o) / d;
+          if (t1 > t2) { var tmp = t1; t1 = t2; t2 = tmp; }
+          if (t1 > tmin) tmin = t1;
+          if (t2 < tmax) tmax = t2;
+          if (tmin > tmax) { hit = false; break; }
         }
-
-        // split velocity (pos - prev) into normal + tangential parts. Kill
-        // the normal part (no bounce), damp only the tangential part so
-        // cloth still slides/slumps off edges and corners instead of
-        // sticking dead in place.
-        var vx = pos[pxI] - prev[pxI];
-        var vy = pos[pyI] - prev[pyI];
-        var vz = pos[pzI] - prev[pzI];
-        var vn = vx * nx + vy * ny + vz * nz;
-        var tx = vx - vn * nx;
-        var ty = vy - vn * ny;
-        var tz = vz - vn * nz;
-
-        prev[pxI] = pos[pxI] - tx * friction;
-        prev[pyI] = pos[pyI] - ty * friction;
-        prev[pzI] = pos[pzI] - tz * friction;
+      }
+      if (hit) {
+        // pull the point back to just before it entered the box,
+        // then let normal resolution below push it out from there
+        px = ppx + dx * tmin; py = ppy + dy * tmin; pz = ppz + dz * tmin;
+        pos[pxI] = px; pos[pyI] = py; pos[pzI] = pz;
+        lx = px - cx; ly = py - cy; lz = pz - cz;
+        inside = true;
       }
     }
+
+    if (!inside) return;
+
+    var ox = hx - Math.abs(lx);
+    var oy = hy - Math.abs(ly);
+    var oz = hz - Math.abs(lz);
+
+    // resting on top but near the edge (within ~15% of the far side)?
+    // taper the vertical support so the point tips and slides off
+    // instead of getting a hard clamp all the way to the corner.
+    var onTop = oy < oz && oy < ox && ly > 0;
+    if (onTop) {
+      var edgeMarginX = half.x * 0.15;
+      var edgeMarginZ = half.z * 0.15;
+      var pastEdge = Math.abs(lx) > half.x - edgeMarginX || Math.abs(lz) > half.z - edgeMarginZ;
+      if (pastEdge) return; // no support here — try next collider / let gravity take it
+    }
+
+    // corner case: when two or more penetration depths are close
+    // together, snapping to a single axis (the old behavior) shoves
+    // the point onto the WRONG face near true 3D corners, producing
+    // visible clipping/poking-through right at box edges. Detect that
+    // near-tie and push out along the true nearest-point direction
+    // instead, which is always correct at corners and edges alike.
+    var minO = Math.min(ox, oy, oz);
+    var closeCount = (ox - minO < minO * 0.35 ? 1 : 0) +
+                      (oy - minO < minO * 0.35 ? 1 : 0) +
+                      (oz - minO < minO * 0.35 ? 1 : 0);
+    var nearCorner = closeCount >= 2;
+
+    var nx = 0, ny = 0, nz = 0;
+    if (nearCorner) {
+      // clamp to the box surface point closest to the cloth point,
+      // then push out along that direction — correct at edges/corners
+      var cxp = Math.max(-hx, Math.min(hx, lx));
+      var cyp = Math.max(-hy, Math.min(hy, ly));
+      var czp = Math.max(-hz, Math.min(hz, lz));
+      var ddx = lx - cxp, ddy = ly - cyp, ddz = lz - czp;
+      var dlen = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+      if (dlen < 1e-6) {
+        // dead center of an edge/corner region — fall back to the
+        // single largest-penetration axis rather than divide by zero
+        if (ox <= oy && ox <= oz) { nx = lx < 0 ? -1 : 1; pos[pxI] = cx + nx * hx; }
+        else if (oy <= oz) { ny = ly < 0 ? -1 : 1; pos[pyI] = cy + ny * hy; }
+        else { nz = lz < 0 ? -1 : 1; pos[pzI] = cz + nz * hz; }
+      } else {
+        nx = ddx / dlen; ny = ddy / dlen; nz = ddz / dlen;
+        pos[pxI] = cx + cxp + nx * skin;
+        pos[pyI] = cy + cyp + ny * skin;
+        pos[pzI] = cz + czp + nz * skin;
+      }
+    } else if (ox < oy && ox < oz) {
+      nx = lx < 0 ? -1 : 1;
+      pos[pxI] = cx + nx * hx;
+    } else if (oy < oz) {
+      ny = ly < 0 ? -1 : 1;
+      pos[pyI] = cy + ny * hy;
+    } else {
+      nz = lz < 0 ? -1 : 1;
+      pos[pzI] = cz + nz * hz;
+    }
+
+    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
   };
 
   /** Simple ground-plane clamp at y = floorY (default 0). Call after step() if desired. */
@@ -586,13 +722,42 @@
     var w = (params.width || 1) / 2 * mesh.scale.x;
     var h = (params.height || 1) / 2 * mesh.scale.y;
     var d = (params.depth || 1) / 2 * mesh.scale.z;
-    return { pos: mesh.position, half: { x: w, y: h, z: d } };
+    return { type: 'box', pos: mesh.position, half: { x: w, y: h, z: d } };
+  }
+
+  /** Convenience: build a { pos, radius } collider from a THREE.Mesh with SphereGeometry. */
+  function sphereCollider(mesh) {
+    var params = mesh.geometry.parameters || {};
+    var r = (params.radius != null ? params.radius : 1) *
+      Math.max(mesh.scale.x, mesh.scale.y, mesh.scale.z);
+    return { type: 'sphere', pos: mesh.position, radius: r };
+  }
+
+  /** Convenience: build a { pos, radius, height } collider from a THREE.Mesh
+   *  with CylinderGeometry (upright, Y-axis). Uses radiusTop for the radius. */
+  function cylinderCollider(mesh) {
+    var params = mesh.geometry.parameters || {};
+    var r = (params.radiusTop != null ? params.radiusTop : 1) * mesh.scale.x;
+    var h = (params.height != null ? params.height : 1) * mesh.scale.y;
+    return { type: 'cylinder', pos: mesh.position, radius: r, height: h };
+  }
+
+  /** Convenience: build a { pos, radius, height } collider from a THREE.Mesh
+   *  with ConeGeometry (apex up, Y-axis). */
+  function coneCollider(mesh) {
+    var params = mesh.geometry.parameters || {};
+    var r = (params.radius != null ? params.radius : 1) * mesh.scale.x;
+    var h = (params.height != null ? params.height : 1) * mesh.scale.y;
+    return { type: 'cone', pos: mesh.position, radius: r, height: h };
   }
 
   return {
     Cloth: Cloth,
     TatterMesh: TatterMesh,
     cloth: function (opts) { return new TatterMesh(opts); },
-    boxCollider: boxCollider
+    boxCollider: boxCollider,
+    sphereCollider: sphereCollider,
+    cylinderCollider: cylinderCollider,
+    coneCollider: coneCollider
   };
 });
