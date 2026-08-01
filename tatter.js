@@ -39,7 +39,26 @@
     this.gravity = opts.gravity != null ? opts.gravity : -0.012;
     this.drag = opts.drag != null ? opts.drag : 0.985;
     this.iterations = opts.iterations || 12;
+    // collision resolution is the expensive part of each iteration
+    // (every point x every collider). Constraints benefit from more
+    // iterations for stiffness, but collision converges fine with fewer —
+    // running it every single constraint iteration was the biggest single
+    // cost in the whole step() call. Default: roughly a third of the
+    // constraint iterations, minimum 3.
+    this.collisionIterations = opts.collisionIterations != null
+      ? opts.collisionIterations
+      : Math.max(3, Math.round(this.iterations / 3));
     this.tearSensitivity = opts.tear === false ? 0 : (opts.tearSensitivity || 2.6);
+    // stretchiness: 0 = rigid (old behavior, constraints correct at full
+    // strength every iteration). Higher = softer/springier — constraints
+    // only partially correct each pass, so under real tension (a pinned
+    // point holding up fabric that's also resting against a floor/collider,
+    // for example) the unpinned area visibly stretches beyond rest length
+    // instead of snapping rigidly taut. 0.35–0.6 reads as cloth-like give;
+    // near 1 gets rubbery.
+    this.stretchiness = opts.stretchiness != null
+      ? Math.max(0, Math.min(0.95, opts.stretchiness))
+      : 0.15;
 
     var n = this.cols * this.rows;
     this.pos = new Float32Array(n * 3);
@@ -124,10 +143,13 @@
 
   /**
    * Advance the simulation by one step.
-   * colliders: optional array of { pos: {x,y,z}, half: {x,y,z} } box colliders
+   * colliders: optional array of collider objects (box/sphere/cylinder/cone)
    * wind: optional { x, y, z } force applied every unpinned point
+   * floorY: optional ground-plane height; if set, cloth collides with it
+   *         through the same iteration loop as everything else (real
+   *         stretch/tension against pins instead of a post-hoc snap)
    */
-  Cloth.prototype.step = function (colliders, wind) {
+  Cloth.prototype.step = function (colliders, wind, floorY) {
     var n = this.cols * this.rows;
     var pos = this.pos, prev = this.prev, pinned = this.pinned;
     var g = this.gravity, drag = this.drag;
@@ -148,6 +170,8 @@
 
     var constraints = this.constraints;
     var tearSens = this.tearSensitivity;
+    var stiffness = 1 - this.stretchiness; // 1 = old rigid behavior
+    var collisionStartIter = this.iterations - this.collisionIterations;
 
     for (var iter = 0; iter < this.iterations; iter++) {
       for (var c = 0; c < constraints.length; c++) {
@@ -165,7 +189,7 @@
           continue;
         }
 
-        var diff = (restLen - dist) / dist * 0.5;
+        var diff = (restLen - dist) / dist * 0.5 * stiffness;
         // clamp the correction so one relaxation pass can't overshoot
         // wildly (this is what produces spikes near sparse pins, where a
         // point gets yanked hard toward a far-away anchor in one step)
@@ -177,20 +201,34 @@
         if (!pinned[b]) { pos[bx] += offx; pos[bx + 1] += offy; pos[bx + 2] += offz; }
       }
 
-      if (colliders && colliders.length) {
-        this._resolveColliders(colliders);
+      // collision only needs to run on the LAST few iterations, after
+      // structural constraints have mostly settled — running it on every
+      // single pass (the old behavior) was the single biggest cost in
+      // this loop for no real accuracy gain, since early iterations get
+      // overwritten by later constraint passes anyway.
+      if (iter >= collisionStartIter && ((colliders && colliders.length) || floorY != null)) {
+        this._resolveColliders(colliders || [], floorY);
       }
     }
   };
 
-  Cloth.prototype._resolveColliders = function (colliders) {
+  Cloth.prototype._resolveColliders = function (colliders, floorY) {
     var n = this.cols * this.rows;
     var pos = this.pos, prev = this.prev, pinned = this.pinned;
 
     for (var p = 0; p < n; p++) {
       if (pinned[p]) continue;
+      if (floorY != null) this._resolveFloor(p, floorY);
       for (var cIdx = 0; cIdx < colliders.length; cIdx++) {
         var col = colliders[cIdx];
+        // set collider.enabled = false to switch collision off for that
+        // object without removing it from the array (e.g. UI toggle) —
+        // any collider NOT present in the colliders array passed to
+        // update()/step() is already ignored by definition, since cloth
+        // only tests against what you hand it. This flag is for cases
+        // where you keep a stable colliders array and just want an
+        // on/off switch per-object at runtime.
+        if (col.enabled === false) continue;
         var type = col.type || 'box';
         if (type === 'sphere') this._resolveSphere(p, col);
         else if (type === 'cylinder') this._resolveCylinder(p, col);
@@ -210,9 +248,17 @@
 
     var lx = pos[pxI] - cx, ly = pos[pyI] - cy, lz = pos[pzI] - cz;
     var distSq = lx * lx + ly * ly + lz * lz;
-    if (distSq >= r * r || distSq < 1e-12) return;
 
-    var dist = Math.sqrt(distSq);
+    if (distSq >= r * r) {
+      // swept guard: cheap midpoint check against prev->pos segment so
+      // a fast-moving point can't skip clean through the sphere in one step
+      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
+      var mlx = (lx + plx) / 2, mly = (ly + ply) / 2, mlz = (lz + plz) / 2;
+      if (mlx * mlx + mly * mly + mlz * mlz >= r * r) return;
+    }
+    if (distSq < 1e-12) return;
+
+    var dist = Math.sqrt(distSq) || 0.0001;
     var nx = lx / dist, ny = ly / dist, nz = lz / dist;
     pos[pxI] = cx + nx * r;
     pos[pyI] = cy + ny * r;
@@ -224,7 +270,7 @@
   // ---- cylinder collider: { type:'cylinder', pos:{x,y,z}, radius, height }
   // axis-aligned to Y (upright), pos is the center ----
   Cloth.prototype._resolveCylinder = function (p, col) {
-    var pos = this.pos;
+    var pos = this.pos, prev = this.prev;
     var skin = 0.06, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
@@ -232,17 +278,53 @@
     var halfH = col.height / 2 + skin;
 
     var lx = pos[pxI] - cx, ly = pos[pyI] - cy, lz = pos[pzI] - cz;
-    if (Math.abs(ly) >= halfH) return;
-
     var radialSq = lx * lx + lz * lz;
-    if (radialSq >= r * r || radialSq < 1e-12) return;
 
-    var radial = Math.sqrt(radialSq);
-    var overRadial = r - radial;
-    var overTop = halfH - Math.abs(ly);
+    var inside = Math.abs(ly) < halfH && radialSq < r * r;
+
+    // swept tunneling guard: cheap approximate check against the previous
+    // position — if we weren't "inside" this frame but the segment from
+    // prev->pos crosses close to the cylinder's radius within its height
+    // band, treat as inside so fast motion can't skip through it entirely
+    if (!inside) {
+      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
+      var midY = (ly + ply) / 2;
+      if (Math.abs(midY) < halfH) {
+        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
+        if (mlx * mlx + mlz * mlz < r * r) inside = true;
+      }
+      if (!inside) return;
+    }
+
+    var radial = Math.sqrt(radialSq) || 0.0001;
+    var overRadial = r - radial;   // how far inside the round wall
+    var overTop = halfH - Math.abs(ly); // how far inside the height band
+
+    // rim/corner case (near BOTH the cap and the wall at once): the old
+    // "pick whichever is smaller" approach snapped only one axis and left
+    // the point still outside the other bound — a leak exactly at the rim,
+    // same failure mode as the box's flat-corner bug. Fix: when both are
+    // small/close, push out along the true nearest point on the rim edge
+    // (radial direction clamped to r, height clamped to halfH) instead of
+    // picking a single axis.
+    var nearRim = overRadial < r * 0.25 && overTop < halfH * 0.25;
 
     var nx = 0, ny = 0, nz = 0;
-    if (overTop < overRadial) {
+    if (nearRim) {
+      var rnx = lx / radial, rnz = lz / radial;
+      var capY = ly < 0 ? -halfH : halfH;
+      var ddx = lx - rnx * r, ddy = ly - capY, ddz = lz - rnz * r;
+      var dlen = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+      if (dlen < 1e-6) {
+        nx = rnx; nz = rnz;
+        pos[pxI] = cx + rnx * r; pos[pzI] = cz + rnz * r;
+      } else {
+        nx = ddx / dlen; ny = ddy / dlen; nz = ddz / dlen;
+        pos[pxI] = cx + rnx * r + nx * skin;
+        pos[pyI] = cy + capY + ny * skin;
+        pos[pzI] = cz + rnz * r + nz * skin;
+      }
+    } else if (overTop < overRadial) {
       ny = ly < 0 ? -1 : 1;
       pos[pyI] = cy + ny * halfH;
     } else {
@@ -258,36 +340,77 @@
   // apex points up: base (widest, radius) at pos.y - height/2, apex (point)
   // at pos.y + height/2 ----
   Cloth.prototype._resolveCone = function (p, col) {
-    var pos = this.pos;
+    var pos = this.pos, prev = this.prev;
     var skin = 0.06, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var baseR = col.radius, h = col.height;
-    var baseY = cy - h / 2, apexY = cy + h / 2;
-
-    var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
-    if (py < baseY - skin || py > apexY + skin) return;
-
-    // radius of the cone's surface at this height (0 at apex, baseR at base)
-    var t = Math.max(0, Math.min(1, (apexY - py) / h)); // 1 at base, 0 at apex
-    var rAtHeight = baseR * t + skin;
-
-    var lx = px - cx, lz = pz - cz;
-    var radialSq = lx * lx + lz * lz;
-    if (radialSq >= rAtHeight * rAtHeight || radialSq < 1e-12) return;
-
-    var radial = Math.sqrt(radialSq);
-    var nxR = lx / radial, nzR = lz / radial;
-
-    // slant normal: combine outward radial direction with the cone's
-    // slope so cloth is pushed away from the slanted surface, not just
-    // straight out radially (which would look wrong on a pointed cone)
+    var baseY = cy - h / 2 - skin, apexY = cy + h / 2;
     var slope = baseR / h;
     var nlen = Math.sqrt(1 + slope * slope);
-    var nx = nxR / nlen, nz = nzR / nlen, ny = slope / nlen;
 
-    pos[pxI] = cx + nxR * rAtHeight;
-    pos[pzI] = cz + nzR * rAtHeight;
+    function radiusAt(y) {
+      var t = Math.max(0, Math.min(1, (apexY - y) / h));
+      return baseR * t;
+    }
+
+    var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
+    var lx = px - cx, lz = pz - cz;
+    var radial = Math.sqrt(lx * lx + lz * lz) || 0.0001;
+    var rAtHeight = radiusAt(py) + skin;
+
+    var insideSlant = py >= baseY && py <= apexY + skin && radial < rAtHeight;
+    // the cone's own flat bottom face — without this, cloth slides under
+    // the base and clips straight through since only the slanted surface
+    // was ever tested before
+    var insideBase = py < cy - h / 2 + skin && py > baseY && radial < baseR + skin;
+
+    var inside = insideSlant || insideBase;
+
+    // swept guard for fast motion skipping through in one step
+    if (!inside) {
+      var ppy = prev[pyI];
+      var midY = (py + ppy) / 2;
+      if (midY >= baseY && midY <= apexY + skin) {
+        var plx = prev[pxI] - cx, plz = prev[pzI] - cz;
+        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
+        var mRadial = Math.sqrt(mlx * mlx + mlz * mlz);
+        if (mRadial < radiusAt(midY) + skin) inside = true;
+      }
+      if (!inside) return;
+    }
+
+    var nx = 0, ny = 0, nz = 0;
+
+    if (insideBase && !insideSlant) {
+      // resolve straight down through the flat base
+      ny = -1;
+      pos[pyI] = baseY;
+    } else {
+      var rnx = lx / radial, rnz = lz / radial;
+      var nearBaseEdge = (py - (cy - h / 2)) < h * 0.15 && (rAtHeight - radial) < rAtHeight * 0.3;
+      if (nearBaseEdge) {
+        // rim between the slant and the flat base — push out to the
+        // nearest point on that rim circle rather than picking one axis,
+        // same corner-leak fix as the box/cylinder cases
+        var edgeY = cy - h / 2;
+        var ddx = lx - rnx * baseR, ddy = py - edgeY, ddz = lz - rnz * baseR;
+        var dlen = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+        if (dlen < 1e-6) {
+          nx = rnx; nz = rnz;
+          pos[pxI] = cx + rnx * baseR; pos[pzI] = cz + rnz * baseR;
+        } else {
+          nx = ddx / dlen; ny = ddy / dlen; nz = ddz / dlen;
+          pos[pxI] = cx + rnx * baseR + nx * skin;
+          pos[pyI] = edgeY + ny * skin;
+          pos[pzI] = cz + rnz * baseR + nz * skin;
+        }
+      } else {
+        nx = rnx / nlen; nz = rnz / nlen; ny = slope / nlen;
+        pos[pxI] = cx + rnx * rAtHeight;
+        pos[pzI] = cz + rnz * rAtHeight;
+      }
+    }
 
     this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
   };
@@ -429,7 +552,24 @@
     this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
   };
 
-  /** Simple ground-plane clamp at y = floorY (default 0). Call after step() if desired. */
+  /** Ground-plane collision at y = floorY (default 0). Unlike the old
+   *  clampFloor (a single hard Y-snap run once after all constraints
+   *  settled, which is why cloth resting on the floor looked disconnected
+   *  from pin tension), this now runs as a proper collider inside the same
+   *  constraint/collision iteration loop as boxes/spheres/etc — so the
+   *  floor and pin tension interact correctly and you get real elastic
+   *  stretch in the unpinned area instead of a silent teleport. */
+  Cloth.prototype._resolveFloor = function (p, floorY) {
+    var pos = this.pos;
+    var skin = 0.02, friction = this.collisionFriction;
+    var pyI = p * 3 + 1;
+    if (pos[pyI] >= floorY + skin) return;
+    pos[pyI] = floorY + skin;
+    this._dampTangential(p * 3, pyI, p * 3 + 2, 0, 1, 0, friction);
+  };
+
+  /** Legacy hard clamp, kept for compatibility — prefer withFloor() on
+   *  TatterMesh, which now uses the proper collider path above. */
   Cloth.prototype.clampFloor = function (floorY) {
     floorY = floorY || 0;
     var n = this.cols * this.rows;
@@ -607,6 +747,8 @@
       gravity: opts.gravity,
       drag: opts.drag,
       iterations: opts.iterations,
+      collisionIterations: opts.collisionIterations,
+      stretchiness: opts.stretchiness,
       tear: opts.tear,
       tearSensitivity: opts.tearSensitivity,
       shear: opts.shear,
@@ -664,18 +806,20 @@
   }
 
   /** Advance physics and sync the mesh geometry. Call once per frame.
-   *  Pass a truthy 3rd arg... actually just set tatter.meshSkip = N to
-   *  throttle the expensive smoothing/normals resync to every Nth call
-   *  (physics itself still steps every call). Default 1 (every frame).
+   *  Set tatter.meshSkip = N to throttle the expensive smoothing/normals
+   *  resync to every Nth call (physics itself still steps every call).
+   *  Default 1 (every frame).
    */
   TatterMesh.prototype.update = function (colliders, wind) {
-    this.cloth.step(colliders, wind);
-    if (this._floorY != null) this.cloth.clampFloor(this._floorY);
+    this.cloth.step(colliders, wind, this._floorY);
     syncMeshGeometry(this.cloth, this.mesh, this.meshSkip || 1);
     return this;
   };
 
-  /** Enable a floor clamp at the given Y (default 0) applied every update(). */
+  /** Enable floor collision at the given Y (default 0), applied every
+   *  update(). Runs as a proper collider inside the physics iteration
+   *  loop, so cloth resting on it shows real elastic stretch against
+   *  whatever's pinning it, instead of a disconnected hard snap. */
   TatterMesh.prototype.withFloor = function (y) {
     this._floorY = y == null ? 0 : y;
     return this;
@@ -751,6 +895,47 @@
     return { type: 'cone', pos: mesh.position, radius: r, height: h };
   }
 
+  /**
+   * Turbulent air wind helper — call once per frame with a running time
+   * value and get back a { x, y, z } force to pass into update()/step(),
+   * instead of hand-rolling sine waves. Layers a few different-frequency
+   * sines per axis plus occasional random gusts so it reads as air
+   * moving, not a metronome.
+   *
+   * wind(t, opts) opts:
+   *   strength   base force magnitude (default 0.006)
+   *   direction  primary push direction, normalized internally (default {x:1,y:0,z:0.3})
+   *   gustiness  0-1, how much random gust variance on top of the base (default 0.4)
+   *   turbulence 0-1, how much extra high-frequency wobble (default 0.5)
+   */
+  function wind(t, opts) {
+    opts = opts || {};
+    var strength = opts.strength != null ? opts.strength : 0.006;
+    var dir = opts.direction || { x: 1, y: 0, z: 0.3 };
+    var gustiness = opts.gustiness != null ? opts.gustiness : 0.4;
+    var turbulence = opts.turbulence != null ? opts.turbulence : 0.5;
+
+    var dlen = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z) || 1;
+    var dx = dir.x / dlen, dy = dir.y / dlen, dz = dir.z / dlen;
+
+    // layered sines: slow gust envelope + faster turbulent wobble
+    var gust = 1 + gustiness * (
+      Math.sin(t * 0.7) * 0.5 +
+      Math.sin(t * 0.23 + 1.7) * 0.35 +
+      Math.sin(t * 1.9 + 4.1) * 0.15
+    );
+    var turbX = turbulence * Math.sin(t * 2.3 + 0.5) * 0.4;
+    var turbY = turbulence * Math.sin(t * 3.1 + 2.2) * 0.15; // gentle vertical flutter
+    var turbZ = turbulence * Math.cos(t * 1.7 + 1.1) * 0.4;
+
+    var mag = strength * Math.max(0, gust);
+    return {
+      x: dx * mag + turbX * strength,
+      y: dy * mag + turbY * strength,
+      z: dz * mag + turbZ * strength
+    };
+  }
+
   return {
     Cloth: Cloth,
     TatterMesh: TatterMesh,
@@ -758,6 +943,7 @@
     boxCollider: boxCollider,
     sphereCollider: sphereCollider,
     cylinderCollider: cylinderCollider,
-    coneCollider: coneCollider
+    coneCollider: coneCollider,
+    wind: wind
   };
 });
