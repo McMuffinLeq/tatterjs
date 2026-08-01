@@ -1,6 +1,6 @@
 # Tatter.js
 
-Fabric physics for Three.js. Verlet-integration cloth simulation in a single JS file — give it a scene, get back a mesh with real gravity, wind, pinning, tearing, elastic stretch, and collision (box, sphere, cylinder, cone, and floor) with realistic sliding, edge falloff, and tunneling-proof, corner-accurate resolution.
+Fabric physics for Three.js. Verlet-integration cloth simulation in a single JS file — give it a scene, get back a mesh with real gravity, wind, rigid pinning, tearing, elastic stretch, and collision (box, sphere, cylinder, cone, and floor) with realistic sliding, edge falloff, and tunneling-proof, corner-accurate resolution.
 
 ## Requirements
 
@@ -67,11 +67,11 @@ someCollider.enabled = false; // cloth passes straight through until re-enabled
 | `drag`                         | `0.985`             | Velocity damping                                                                          |
 | `iterations`                   | `12`                | Constraint solver passes per step (higher = stiffer cloth)                                |
 | `collisionIterations`          | `~iterations / 3`   | How many of the *last* constraint iterations also resolve collision. Lower = faster, less accurate against fast motion. See **Performance** below. |
-| `stretchiness`                 | `0.15`              | `0` = rigid (old behavior). Higher = softer/springier constraints, so fabric under real tension (e.g. pinned at the top, resting on a floor below) visibly stretches instead of snapping taut or teleporting. `0.3–0.6` reads as cloth-like give. |
+| `stretchiness`                 | `0.15`              | `0` = rigid (old behavior). Higher = softer/springier constraints, so fabric under real tension (e.g. pinned at the top, resting on a floor below) visibly stretches instead of snapping taut or teleporting. `0.3–0.6` reads as cloth-like give. Only affects constraints between two unpinned points — see **Pinning** below. |
 | `shear`                        | `true`              | Diagonal constraints for a fabric-like drape instead of a diamond collapse                |
 | `tear`                         | `true`              | Whether constraints can break under stress                                                |
 | `tearSensitivity`              | `2.6`               | Stretch multiplier before a constraint tears                                              |
-| `pin`                          | `'top'`             | `'top'`, `'corners'`, a function `(x, y, cols, rows) => bool`, or `false` for no pinning  |
+| `pin`                          | `'top'`             | `'top'`, `'corners'`, a function `(x, y, cols, rows) => bool`, or `false` for no pinning. Pinned points connect to their neighbors as rigid rods — see **Pinning** below. |
 | `pinEvery`                     | `1`                 | With `pin: 'top'`, pin every Nth point along the row                                     |
 | `smooth`                       | `3`                 | Renders a Catmull-Rom-smoothed mesh at N× the physics grid density. Pass `false` or `1` for raw grid-resolution rendering. |
 | `meshSkip`                     | `2`                 | Only resync/re-smooth the visible mesh every Nth `update()` call; physics still steps every call. Raise for more FPS, lower (`1`) for max fidelity. |
@@ -96,6 +96,17 @@ flag.withFloor(0); // enable, at y = 0
 ```
 
 Runs as a proper collider *inside* the same physics iteration loop as everything else, not a separate hard Y-snap applied after the fact. This matters: cloth pinned at the top and resting on the floor now shows real elastic tension between the pins and the floor (especially with `stretchiness` turned up) instead of the unpinned area looking disconnected or silently teleporting onto the floor each frame.
+
+## Pinning
+
+```js
+flag.pinPoint(x, y);
+flag.unpinPoint(x, y);
+flag.pinRow(0, 2);   // pin every 2nd point in row 0
+flag.setPinPosition(x, y, worldX, worldY, worldZ); // move a pin, e.g. attach to a flagpole
+```
+
+Any constraint with a pinned point at one end acts as a rigid rod: full-strength correction every iteration and immune to tearing, regardless of `stretchiness` or `tearSensitivity`. This makes pins feel like anchors — the fabric hangs and stretches, but the geometry right at a pin stays taut and doesn't rip loose under stress. `stretchiness` and tearing still apply normally everywhere else in the cloth, i.e. to constraints between two unpinned points.
 
 ## Wind
 

@@ -184,12 +184,17 @@
         var dz = pos[bx + 2] - pos[ax + 2];
         var dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.0001;
 
-        if (tearSens && dist > restLen * tearSens) {
+        if (tearSens && dist > restLen * tearSens && !pinned[a] && !pinned[b]) {
           con[3] = 1;
           continue;
         }
 
-        var diff = (restLen - dist) / dist * 0.5 * stiffness;
+        // a constraint touching a pinned point acts as a rigid rod (full
+        // correction, ignores stretchiness) instead of the softer cloth-wide
+        // stiffness — pins should feel like anchors, not like they're on
+        // the end of a soft spring
+        var conStiffness = (pinned[a] || pinned[b]) ? 1 : stiffness;
+        var diff = (restLen - dist) / dist * 0.5 * conStiffness;
         // clamp the correction so one relaxation pass can't overshoot
         // wildly (this is what produces spikes near sparse pins, where a
         // point gets yanked hard toward a far-away anchor in one step)
