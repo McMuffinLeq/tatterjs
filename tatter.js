@@ -258,6 +258,20 @@
         this._resolveThickness();
       }
     }
+
+    // BUGFIX: _resolveThickness (self/cross-cloth collision) runs AFTER
+    // collider resolution every iteration above, and it has zero
+    // awareness of colliders — it only pushes points apart based on
+    // fabric-to-fabric distance. That means it can shove a point that
+    // was just correctly resolved against a box corner back inside the
+    // box, on the very last iteration, with nothing after it to catch
+    // the re-penetration — this is what read as "clipping through
+    // corners": the corner push-out logic was firing and computing the
+    // right answer, then getting silently overwritten. Give colliders
+    // the guaranteed last word with one final pass.
+    if ((colliders && colliders.length) || floorY != null) {
+      this._resolveColliders(colliders || [], floorY);
+    }
   };
 
   Cloth.prototype._resolveColliders = function (colliders, floorY) {
