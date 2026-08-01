@@ -47,7 +47,7 @@
     // constraint iterations, minimum 3.
     this.collisionIterations = opts.collisionIterations != null
       ? opts.collisionIterations
-      : Math.max(3, Math.round(this.iterations / 3));
+      : Math.max(2, Math.round(this.iterations / 4));
     this.tearSensitivity = opts.tear === false ? 0 : (opts.tearSensitivity || 2.6);
     // stretchiness: 0 = rigid (old behavior, constraints correct at full
     // strength every iteration). Higher = softer/springier — constraints
@@ -738,9 +738,9 @@
     // near-tie and push out along the true nearest-point direction
     // instead, which is always correct at corners and edges alike.
     var minO = Math.min(ox, oy, oz);
-    var closeCount = (ox - minO < minO * 0.35 ? 1 : 0) +
-                      (oy - minO < minO * 0.35 ? 1 : 0) +
-                      (oz - minO < minO * 0.35 ? 1 : 0);
+    var closeCount = (ox - minO < minO * 0.6 ? 1 : 0) +
+                      (oy - minO < minO * 0.6 ? 1 : 0) +
+                      (oz - minO < minO * 0.6 ? 1 : 0);
     var nearCorner = closeCount >= 2;
 
     var nx = 0, ny = 0, nz = 0;
