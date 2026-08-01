@@ -401,13 +401,26 @@
 
     var selfMap = this.selfCollision ? this._buildSpatialHash() : null;
 
-    // gather other active cloths once per pass, if crossCollision is on
+    // gather other active cloths AND pre-build each of their spatial
+    // hashes ONCE per call (not once per point!). The old code called
+    // other._buildSpatialHash() inside the per-point loop below, which
+    // rebuilt a full O(n) hash for every point on this cloth times every
+    // other cloth times every collision iteration — by far the biggest
+    // cost in the whole step for any scene with crossCollision on and
+    // more than one cloth. The other cloth's points don't move between
+    // those rebuilds within a single _resolveThickness() call, so one
+    // hash per other-cloth per call is correct and dramatically cheaper.
     var others = null;
+    var othersHashes = null;
     if (this.crossCollision) {
       others = [];
+      othersHashes = [];
       for (var oc = 0; oc < Cloth._active.length; oc++) {
         var otherCloth = Cloth._active[oc];
-        if (otherCloth !== this) others.push(otherCloth);
+        if (otherCloth !== this) {
+          others.push(otherCloth);
+          othersHashes.push(otherCloth._buildSpatialHash());
+        }
       }
     }
 
@@ -449,7 +462,7 @@
           var otherCell = other.thickness || other.spacing;
           var crossMinDist = (minDist + otherCell) * 0.5;
           var crossMinDistSq = crossMinDist * crossMinDist;
-          var otherHash = other._buildSpatialHash();
+          var otherHash = othersHashes[oi];
           var ocx = Math.floor(px / otherCell);
           var ocy = Math.floor(py / otherCell);
           var ocz = Math.floor(pz / otherCell);
@@ -1018,21 +1031,41 @@
 
     var hx = half.x + skin, hy = half.y + skin, hz = half.z + skin;
 
+    // FIX (tunneling with fast-moving colliders): the swept test below
+    // only ever accounted for how far the CLOTH POINT moved between
+    // prev/pos. A collider that itself moves fast (e.g. a block swept
+    // back and forth every frame) can displace by more than its own
+    // half-width in one step — the point can end up "outside" the box
+    // at both the old and new collider position, so the point-only
+    // swept test never sees a crossing at all and cloth clips straight
+    // through. Track each collider's own previous-frame position (set
+    // once via _prevPos, keyed by the collider object itself) and fold
+    // that displacement into the effective half-extents used for the
+    // swept test, so a fast-moving box is also covered, not just a
+    // fast-moving point. This only affects the SWEPT test region — the
+    // final resting push-out below still uses the true hx/hy/hz.
+    if (!col._prevPos) col._prevPos = { x: cx, y: cy, z: cz };
+    var colDx = cx - col._prevPos.x, colDy = cy - col._prevPos.y, colDz = cz - col._prevPos.z;
+    var shx = hx + Math.abs(colDx), shy = hy + Math.abs(colDy), shz = hz + Math.abs(colDz);
+    col._prevPos.x = cx; col._prevPos.y = cy; col._prevPos.z = cz;
+
     var lx = px - cx, ly = py - cy, lz = pz - cz;
     var inside = Math.abs(lx) < hx && Math.abs(ly) < hy && Math.abs(lz) < hz;
 
     // if not resolved as "inside" this frame, still check whether the
-    // point tunneled straight through the box between prev and pos
-    // (fast wind/gravity/collider motion can skip a thin box entirely
-    // in one step, or skin-boundary rounding can leave a point sitting
-    // exactly on the edge). Always run a swept AABB test against the
-    // prev->pos segment rather than gating on a "was outside" check,
-    // since that boundary comparison is float-precision-fragile.
+    // point tunneled straight through the box between prev and pos —
+    // OR the box tunneled through the point, now covered by the
+    // expanded shx/shy/shz above. (Fast wind/gravity/collider motion
+    // can skip a thin box entirely in one step, or skin-boundary
+    // rounding can leave a point sitting exactly on the edge.) Always
+    // run a swept AABB test against the prev->pos segment rather than
+    // gating on a "was outside" check, since that boundary comparison
+    // is float-precision-fragile.
     if (!inside) {
       var plx = ppx - cx, ply = ppy - cy, plz = ppz - cz;
       var dx = px - ppx, dy = py - ppy, dz = pz - ppz;
       var tmin = 0, tmax = 1;
-      var axes = [[plx, dx, hx], [ply, dy, hy], [plz, dz, hz]];
+      var axes = [[plx, dx, shx], [ply, dy, shy], [plz, dz, shz]];
       var hit = true;
       for (var ai = 0; ai < 3; ai++) {
         var o = axes[ai][0], d = axes[ai][1], h = axes[ai][2];
