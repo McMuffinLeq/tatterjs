@@ -738,18 +738,27 @@
     // near-tie and push out along the true nearest-point direction
     // instead, which is always correct at corners and edges alike.
     var minO = Math.min(ox, oy, oz);
-    var closeCount = (ox - minO < minO * 0.6 ? 1 : 0) +
-                      (oy - minO < minO * 0.6 ? 1 : 0) +
-                      (oz - minO < minO * 0.6 ? 1 : 0);
+    var closeCount = (ox - minO < minO * 0.35 ? 1 : 0) +
+                      (oy - minO < minO * 0.35 ? 1 : 0) +
+                      (oz - minO < minO * 0.35 ? 1 : 0);
     var nearCorner = closeCount >= 2;
 
     var nx = 0, ny = 0, nz = 0;
     if (nearCorner) {
-      // clamp to the box surface point closest to the cloth point,
-      // then push out along that direction — correct at edges/corners
-      var cxp = Math.max(-hx, Math.min(hx, lx));
-      var cyp = Math.max(-hy, Math.min(hy, ly));
-      var czp = Math.max(-hz, Math.min(hz, lz));
+      // clamp to the box SURFACE point closest to the cloth point, then
+      // push out along that direction — correct at edges/corners.
+      // NOTE: lx/ly/lz are already inside [-h,h] here (inside === true).
+      // Only the axes actually part of the near-tie (small penetration
+      // depth) should snap to their face; an axis NOT in the tie keeps
+      // its own coordinate (a true no-op clamp), since it isn't near
+      // its wall and shouldn't be pulled toward it — that's what makes
+      // this correct for 2-axis edges as well as 3-axis corners.
+      var xClose = ox - minO < minO * 0.35;
+      var yClose = oy - minO < minO * 0.35;
+      var zClose = oz - minO < minO * 0.35;
+      var cxp = xClose ? (lx < 0 ? -hx : hx) : lx;
+      var cyp = yClose ? (ly < 0 ? -hy : hy) : ly;
+      var czp = zClose ? (lz < 0 ? -hz : hz) : lz;
       var ddx = lx - cxp, ddy = ly - cyp, ddz = lz - czp;
       var dlen = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
       if (dlen < 1e-6) {
