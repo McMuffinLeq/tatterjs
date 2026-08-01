@@ -1,6 +1,6 @@
 # Tatter.js
 
-Fabric physics for Three.js. Verlet-integration cloth simulation in a single JS file — give it a scene, get back a mesh with real gravity, wind, rigid pinning, tearing, elastic stretch, and collision (box, sphere, cylinder, cone, and floor) with realistic sliding, edge falloff, and tunneling-proof, corner-accurate resolution.
+Fabric physics for Three.js. Verlet-integration cloth simulation in a single JS file — give it a scene, get back a mesh with real gravity, wind, rigid pinning, tearing, elastic stretch, self-collision, cross-cloth collision, and collision (box, sphere, cylinder, cone, and floor) with realistic sliding, edge falloff, and tunneling-proof, corner-accurate resolution.
 
 ## Requirements
 
@@ -71,6 +71,9 @@ someCollider.enabled = false; // cloth passes straight through until re-enabled
 | `shear`                        | `true`              | Diagonal constraints for a fabric-like drape instead of a diamond collapse                |
 | `tear`                         | `true`              | Whether constraints can break under stress                                                |
 | `tearSensitivity`              | `2.6`               | Stretch multiplier before a constraint tears                                              |
+| `selfCollision`                | `true`              | Point-vs-point thickness collision within this cloth, so folds don't clip through nearby parts of the same sheet. See **Self- and cross-cloth collision** below. |
+| `crossCollision`               | `true`              | Point-vs-point thickness collision against every other active `Tatter.cloth()` in the scene, so two separate cloths don't pass through each other. See **Self- and cross-cloth collision** below. |
+| `thickness`                    | `spacing * 0.85`    | Minimum allowed distance between two non-adjacent points before `selfCollision`/`crossCollision` push them apart. Roughly "how thick the fabric feels." |
 | `pin`                          | `'top'`             | `'top'`, `'corners'`, a function `(x, y, cols, rows) => bool`, or `false` for no pinning. Pinned points connect to their neighbors as rigid rods — see **Pinning** below. |
 | `pinEvery`                     | `1`                 | With `pin: 'top'`, pin every Nth point along the row                                     |
 | `smooth`                       | `3`                 | Renders a Catmull-Rom-smoothed mesh at N× the physics grid density. Pass `false` or `1` for raw grid-resolution rendering. |
@@ -83,7 +86,7 @@ someCollider.enabled = false; // cloth passes straight through until re-enabled
 
 All collider types (box, sphere, cylinder, cone, floor) share the same collision core:
 
-- **Tunneling-proof**: if a point would move straight through a collider in a single step (fast wind, gravity, or a fast-moving collider), a swept check catches the crossing so it can't skip through in one frame.
+- **Tunneling-proof**: if a point would move straight through a collider in a single step (fast wind, gravity, a fast-moving collider, or just a low frame rate producing big per-step jumps), a swept check samples several points along that step's motion so the crossing can't be skipped. The box collider uses an exact swept-AABB test; sphere, cylinder, and cone use multi-sample sweeps tuned for their curved/tapered surfaces (the cone especially needs this near its narrow apex, where a single midpoint sample isn't enough).
 - **Corner/rim-accurate**: near a box corner, a cylinder's rim (where the cap meets the wall), or a cone's rim (where the slant meets the base), the resolver pushes to the true nearest surface point instead of snapping to a single axis — this is what fixes fabric visibly poking through corners.
 - **Sliding, not sticking**: a point that hits a collider keeps its tangential velocity instead of freezing in place, so cloth visibly slides across the surface. That slide is damped by `collisionFriction` (default `0.35` — lower slides more, higher grips more), set via `cloth.collisionFriction = 0.6` (or `flag.cloth.collisionFriction` on a `TatterMesh`).
 - **Edge falloff (box only)**: a point resting on top of a box loses vertical support once it's within ~15% of the box's edge, so cloth naturally tips and falls off corners instead of wrapping the box like shrink-wrap.
@@ -96,6 +99,31 @@ flag.withFloor(0); // enable, at y = 0
 ```
 
 Runs as a proper collider *inside* the same physics iteration loop as everything else, not a separate hard Y-snap applied after the fact. This matters: cloth pinned at the top and resting on the floor now shows real elastic tension between the pins and the floor (especially with `stretchiness` turned up) instead of the unpinned area looking disconnected or silently teleporting onto the floor each frame.
+
+### Self- and cross-cloth collision
+
+Every collider check above is cloth-vs-*shape*. Separately, `selfCollision` and `crossCollision` (both on by default) stop cloth from clipping through *fabric* — the same sheet folding onto itself, or two different `Tatter.cloth()` instances passing through each other:
+
+```js
+const flag = Tatter.cloth({
+  // ...
+  selfCollision: true,   // default — fabric won't clip through its own folds
+  crossCollision: true,  // default — fabric won't clip through OTHER Tatter cloths
+  thickness: 0.05        // optional — minimum gap enforced between non-adjacent points, default spacing * 0.85
+});
+```
+
+Implementation: each collision pass builds a spatial hash of the cloth's own points, then for every point checks the ~27 neighboring hash cells for any *non-adjacent* point (points directly joined by a structural constraint are expected to be close and are skipped) closer than `thickness`, and pushes the pair apart. `crossCollision` does the same lookup against every other currently-active `Tatter.cloth()`/`Tatter.Cloth` instance. Cost stays roughly linear in point count either way, since only nearby cells are ever compared — not every pair.
+
+A pinned point never moves for this either, same as with shape colliders — if two pinned points from different cloths are placed overlapping in the scene, that's a scene setup issue neither cloth can resolve on its own.
+
+Turn it off per-cloth if you don't need it and want the extra iterations back:
+
+```js
+const backdrop = Tatter.cloth({ selfCollision: false, crossCollision: false, /* ... */ });
+```
+
+`Cloth` instances unregister themselves from the cross-collision registry automatically when you call `dispose()`.
 
 ## Pinning
 
@@ -124,12 +152,13 @@ Layers a few different-frequency sines per axis plus gust variance so it reads a
 
 ## Performance
 
-Two knobs matter most on mobile:
+Three knobs matter most on mobile:
 
 - **`meshSkip`** (default `2`): the smoothing resample + normal recomputation is the most expensive part of the render side. Throttling it to every 2nd–4th frame is visually indistinguishable for cloth (it moves slowly) but cuts that cost proportionally. `flag.meshSkip = 3` to try a higher value.
 - **`collisionIterations`** (default ~1/3 of `iterations`): collision resolution runs against every point × every collider, every active iteration — the most expensive part of the physics side. It only needs to run on the last few passes after structural constraints have mostly settled; running it on all 12 iterations (the old behavior) was the single biggest cost in the whole step.
+- **`selfCollision` / `crossCollision`** (default `true`): the spatial-hash thickness pass runs alongside collider resolution on the same last-few iterations. It's cheap per point (only nearby hash cells are checked), but on very dense grids or scenes with many cloths it adds up. Set either to `false` on cloths where clipping isn't visually noticeable (e.g. a backdrop banner far from anything else) to skip that pass entirely.
 
-If it's still slow after tuning both, drop `cols`/`rows` or the `smooth` factor next — a true GPU-driven solver (compute shaders / transform feedback) would be a much larger rewrite than this library targets; the constraint solver is inherently sequential per relaxation pass, which doesn't parallelize onto the GPU without changing the algorithm itself.
+If it's still slow after tuning those, drop `cols`/`rows` or the `smooth` factor next — a true GPU-driven solver (compute shaders / transform feedback) would be a much larger rewrite than this library targets; the constraint solver is inherently sequential per relaxation pass, which doesn't parallelize onto the GPU without changing the algorithm itself.
 
 ## API
 
@@ -144,7 +173,7 @@ cloth.pinRow(rowIndex, every);
 cloth.pinPoint(x, y);
 cloth.unpinPoint(x, y);
 cloth.setPinPosition(x, y, worldX, worldY, worldZ); // move a pinned point (e.g. attach to a flagpole)
-cloth.dispose();                      // free geometry/material
+cloth.dispose();                      // free geometry/material, unregister from crossCollision
 
 Tatter.boxCollider(mesh);             // build a collider from a THREE.Mesh with BoxGeometry
 Tatter.sphereCollider(mesh);          // ...with SphereGeometry
@@ -153,7 +182,7 @@ Tatter.coneCollider(mesh);            // ...with ConeGeometry (apex up, Y-axis)
 Tatter.wind(t, opts);                 // turbulent air wind force generator, see Wind above
 ```
 
-The underlying simulation (`Tatter.Cloth`) is also exported directly if you want to drive your own mesh/rendering instead of using `TatterMesh`. Its `step(colliders, wind, floorY)` takes the same collider array, wind vector, and an optional floor height.
+The underlying simulation (`Tatter.Cloth`) is also exported directly if you want to drive your own mesh/rendering instead of using `TatterMesh`. Its `step(colliders, wind, floorY)` takes the same collider array, wind vector, and an optional floor height. Every `new Tatter.Cloth(...)` registers itself in a shared list for `crossCollision`; call `cloth.disposeCloth()` when you're done with a raw `Cloth` instance so other cloths stop checking against it.
 
 ## Files
 

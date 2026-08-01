@@ -60,11 +60,28 @@
       ? Math.max(0, Math.min(0.95, opts.stretchiness))
       : 0.15;
 
+    // point-vs-point thickness collision: keeps cloth from clipping
+    // through itself (folds passing through nearby parts of the same
+    // sheet) and, when crossCollision is on, through OTHER Tatter cloths
+    // in the scene too. Off by default costs nothing; on, it's an
+    // additional spatial-hash pass alongside collider resolution.
+    this.selfCollision = opts.selfCollision !== false;
+    this.crossCollision = opts.crossCollision !== false;
+    // minimum allowed distance between two non-adjacent points before
+    // they're pushed apart — defaults to a fraction of point spacing,
+    // since that's the natural "thickness" scale of this grid
+    this.thickness = opts.thickness != null ? opts.thickness : opts.spacing * 0.85;
+
     var n = this.cols * this.rows;
     this.pos = new Float32Array(n * 3);
     this.prev = new Float32Array(n * 3);
     this.pinned = new Uint8Array(n);
     this.constraints = []; // [iA, iB, restLength, broken(0/1)]
+    // adjacency lookup (built as constraints are added, see
+    // _addConstraint) so self-collision can skip directly-constrained
+    // point pairs, which are expected to be close and shouldn't be
+    // pushed apart by the thickness pass
+    this._adjacencySets = [];
 
     var self = this;
     function idx(x, y) { return y * self.cols + x; }
@@ -106,7 +123,15 @@
         }
       }
     }
+
+    // register with the global active-cloth list so other cloths can
+    // find and collide against this one (crossCollision). See dispose().
+    Cloth._active.push(this);
   }
+
+  // global list of live Cloth instances, used for crossCollision so one
+  // cloth can find and push against every other cloth currently in play
+  Cloth._active = [];
 
   Cloth.prototype._addConstraint = function (a, b) {
     var ax = this.pos[a * 3], ay = this.pos[a * 3 + 1], az = this.pos[a * 3 + 2];
@@ -114,6 +139,17 @@
     var dx = bx - ax, dy = by - ay, dz = bz - az;
     var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     this.constraints.push([a, b, len, 0]);
+    // adjacency set used by self-collision to skip pairs that are
+    // supposed to be close together (directly connected by a constraint)
+    (this._adjacencySets[a] || (this._adjacencySets[a] = {}))[b] = 1;
+    (this._adjacencySets[b] || (this._adjacencySets[b] = {}))[a] = 1;
+  };
+
+  /** Stop simulating and remove this cloth from the crossCollision registry.
+   *  TatterMesh.dispose() calls this for you. */
+  Cloth.prototype.disposeCloth = function () {
+    var i = Cloth._active.indexOf(this);
+    if (i !== -1) Cloth._active.splice(i, 1);
   };
 
   Cloth.prototype.pinRow = function (rowIndex, every) {
@@ -214,6 +250,13 @@
       if (iter >= collisionStartIter && ((colliders && colliders.length) || floorY != null)) {
         this._resolveColliders(colliders || [], floorY);
       }
+      // thickness collision: stops fabric from clipping through itself
+      // (self-folding) and, if other Tatter cloths are active, through
+      // them too. Also only needs the last few iterations — it's a
+      // correction pass, same reasoning as collider resolution above.
+      if (iter >= collisionStartIter && (this.selfCollision || this.crossCollision)) {
+        this._resolveThickness();
+      }
     }
   };
 
@@ -243,6 +286,162 @@
     }
   };
 
+  // ---- thickness collision: point-vs-point repulsion so cloth doesn't
+  // clip through itself (self-collision) or through other active Tatter
+  // cloths (crossCollision). Uses a spatial hash so it stays roughly
+  // O(n) instead of testing every pair — only points that land in the
+  // same or neighboring grid cell are ever compared.
+  Cloth.prototype._buildSpatialHash = function () {
+    var n = this.cols * this.rows;
+    var pos = this.pos;
+    var cell = this.thickness || this.spacing;
+    var map = {};
+    for (var i = 0; i < n; i++) {
+      var ix = i * 3;
+      var cx = Math.floor(pos[ix] / cell);
+      var cy = Math.floor(pos[ix + 1] / cell);
+      var cz = Math.floor(pos[ix + 2] / cell);
+      var key = cx + ',' + cy + ',' + cz;
+      (map[key] || (map[key] = [])).push(i);
+    }
+    this._hashCell = cell;
+    return map;
+  };
+
+  Cloth.prototype._resolveThickness = function () {
+    var n = this.cols * this.rows;
+    var pos = this.pos, pinned = this.pinned;
+    var cell = this.thickness || this.spacing;
+    var minDist = this.thickness;
+    var minDistSq = minDist * minDist;
+    var adjacency = this._adjacencySets || [];
+
+    var selfMap = this.selfCollision ? this._buildSpatialHash() : null;
+
+    // gather other active cloths once per pass, if crossCollision is on
+    var others = null;
+    if (this.crossCollision) {
+      others = [];
+      for (var oc = 0; oc < Cloth._active.length; oc++) {
+        var otherCloth = Cloth._active[oc];
+        if (otherCloth !== this) others.push(otherCloth);
+      }
+    }
+
+    for (var p = 0; p < n; p++) {
+      var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
+      var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
+      var pPinned = pinned[p];
+
+      var cx = Math.floor(px / cell);
+      var cy = Math.floor(py / cell);
+      var cz = Math.floor(pz / cell);
+
+      // self-collision: check the 27 neighboring cells in this cloth's hash
+      if (selfMap) {
+        for (var dx = -1; dx <= 1; dx++) {
+          for (var dy = -1; dy <= 1; dy++) {
+            for (var dz = -1; dz <= 1; dz++) {
+              var bucket = selfMap[(cx + dx) + ',' + (cy + dy) + ',' + (cz + dz)];
+              if (!bucket) continue;
+              for (var bi = 0; bi < bucket.length; bi++) {
+                var q = bucket[bi];
+                if (q <= p) continue; // each pair handled once
+                if (adjacency[p] && adjacency[p][q]) continue; // structurally connected, expected to be close
+                this._pushApart(p, q, minDist, minDistSq, pPinned, pinned[q]);
+              }
+            }
+          }
+        }
+      }
+
+      // cross-collision: check this cloth's point against nearby points
+      // in every other active cloth, using each other cloth's own
+      // spatial hash (built lazily, cached for this pass) instead of a
+      // brute O(n*m) scan across all of its points.
+      if (others) {
+        for (var oi = 0; oi < others.length; oi++) {
+          var other = others[oi];
+          var opos = other.pos, opinned = other.pinned;
+          var otherCell = other.thickness || other.spacing;
+          var crossMinDist = (minDist + otherCell) * 0.5;
+          var crossMinDistSq = crossMinDist * crossMinDist;
+          var otherHash = other._buildSpatialHash();
+          var ocx = Math.floor(px / otherCell);
+          var ocy = Math.floor(py / otherCell);
+          var ocz = Math.floor(pz / otherCell);
+          for (var odx = -1; odx <= 1; odx++) {
+            for (var ody = -1; ody <= 1; ody++) {
+              for (var odz = -1; odz <= 1; odz++) {
+                var obucket = otherHash[(ocx + odx) + ',' + (ocy + ody) + ',' + (ocz + odz)];
+                if (!obucket) continue;
+                for (var obi = 0; obi < obucket.length; obi++) {
+                  var oq = obucket[obi];
+                  var oqI = oq * 3;
+                  var ddx = opos[oqI] - px, ddy = opos[oqI + 1] - py, ddz = opos[oqI + 2] - pz;
+                  var dSq = ddx * ddx + ddy * ddy + ddz * ddz;
+                  if (dSq >= crossMinDistSq) continue;
+                  var d, nx2, ny2, nz2;
+                  if (dSq < 1e-12) {
+                    // coincident points: same deterministic fallback as
+                    // self-collision, otherwise they'd stay stuck at
+                    // zero distance forever instead of separating
+                    var seed2 = (p * 928371 + oq * 51749 + oi * 7919) % 1000 / 1000;
+                    var theta2 = seed2 * Math.PI * 2;
+                    var phi2 = ((p ^ oq) % 997) / 997 * Math.PI;
+                    nx2 = Math.sin(phi2) * Math.cos(theta2);
+                    ny2 = Math.cos(phi2);
+                    nz2 = Math.sin(phi2) * Math.sin(theta2);
+                    d = 0;
+                  } else {
+                    d = Math.sqrt(dSq);
+                    nx2 = ddx / d; ny2 = ddy / d; nz2 = ddz / d;
+                  }
+                  var push2 = (crossMinDist - d) * 0.5;
+                  if (!pPinned) { pos[pxI] -= nx2 * push2; pos[pyI] -= ny2 * push2; pos[pzI] -= nz2 * push2; }
+                  if (!opinned[oq]) { opos[oqI] += nx2 * push2; opos[oqI + 1] += ny2 * push2; opos[oqI + 2] += nz2 * push2; }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  // shared pair-separation used by self-collision
+  Cloth.prototype._pushApart = function (p, q, minDist, minDistSq, pPinned, qPinned) {
+    var pos = this.pos;
+    var pxI = p * 3, qxI = q * 3;
+    var dx = pos[qxI] - pos[pxI];
+    var dy = pos[qxI + 1] - pos[pxI + 1];
+    var dz = pos[qxI + 2] - pos[pxI + 2];
+    var distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq >= minDistSq) return;
+    var dist, nx, ny, nz;
+    if (distSq < 1e-12) {
+      // exactly (or near-exactly) coincident points have no defined
+      // direction to separate along — division by dist would be 0/0.
+      // Fall back to a small deterministic offset derived from the point
+      // indices so the pair still separates instead of sitting stuck at
+      // zero distance forever (which is what silently caused visible
+      // clipping in this exact case before).
+      var seed = (p * 928371 + q * 51749) % 1000 / 1000;
+      var theta = seed * Math.PI * 2;
+      var phi = ((p ^ q) % 997) / 997 * Math.PI;
+      nx = Math.sin(phi) * Math.cos(theta);
+      ny = Math.cos(phi);
+      nz = Math.sin(phi) * Math.sin(theta);
+      dist = 0;
+    } else {
+      dist = Math.sqrt(distSq);
+      nx = dx / dist; ny = dy / dist; nz = dz / dist;
+    }
+    var push = (minDist - dist) * 0.5;
+    if (!pPinned) { pos[pxI] -= nx * push; pos[pxI + 1] -= ny * push; pos[pxI + 2] -= nz * push; }
+    if (!qPinned) { pos[qxI] += nx * push; pos[qxI + 1] += ny * push; pos[qxI + 2] += nz * push; }
+  };
+
   // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
   Cloth.prototype._resolveSphere = function (p, col) {
     var pos = this.pos, prev = this.prev;
@@ -255,11 +454,21 @@
     var distSq = lx * lx + ly * ly + lz * lz;
 
     if (distSq >= r * r) {
-      // swept guard: cheap midpoint check against prev->pos segment so
-      // a fast-moving point can't skip clean through the sphere in one step
-      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
-      var mlx = (lx + plx) / 2, mly = (ly + ply) / 2, mlz = (lz + plz) / 2;
-      if (mlx * mlx + mly * mly + mlz * mlz >= r * r) return;
+      // swept guard: sample several points along prev->pos so a fast-moving
+      // point can't skip clean through the sphere in one step (a single
+      // midpoint sample can still miss on a sharp near-tangent pass)
+      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
+      var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
+      var hitSphere = false;
+      var SPH_SAMPLES = 4;
+      for (var ss = 1; ss <= SPH_SAMPLES && !hitSphere; ss++) {
+        var st = ss / (SPH_SAMPLES + 1);
+        var sx = (ppx + (px0 - ppx) * st) - cx;
+        var sy = (ppy + (py0 - ppy) * st) - cy;
+        var sz = (ppz + (pz0 - ppz) * st) - cz;
+        if (sx * sx + sy * sy + sz * sz < r * r) hitSphere = true;
+      }
+      if (!hitSphere) return;
     }
     if (distSq < 1e-12) return;
 
@@ -287,16 +496,20 @@
 
     var inside = Math.abs(ly) < halfH && radialSq < r * r;
 
-    // swept tunneling guard: cheap approximate check against the previous
-    // position — if we weren't "inside" this frame but the segment from
-    // prev->pos crosses close to the cylinder's radius within its height
-    // band, treat as inside so fast motion can't skip through it entirely
+    // swept tunneling guard: sample several points along prev->pos so
+    // fast motion can't skip through the cylinder entirely — a single
+    // midpoint sample can still miss near the rim/cap edges
     if (!inside) {
-      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
-      var midY = (ly + ply) / 2;
-      if (Math.abs(midY) < halfH) {
-        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
-        if (mlx * mlx + mlz * mlz < r * r) inside = true;
+      var ppx = prev[pxI], ppy2 = prev[pyI], ppz = prev[pzI];
+      var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
+      var CYL_SAMPLES = 4;
+      for (var cs = 1; cs <= CYL_SAMPLES && !inside; cs++) {
+        var ct = cs / (CYL_SAMPLES + 1);
+        var sy = (ppy2 + (py0 - ppy2) * ct) - cy;
+        if (Math.abs(sy) >= halfH) continue;
+        var sx = (ppx + (px0 - ppx) * ct) - cx;
+        var sz = (ppz + (pz0 - ppz) * ct) - cz;
+        if (sx * sx + sz * sz < r * r) inside = true;
       }
       if (!inside) return;
     }
@@ -372,15 +585,23 @@
 
     var inside = insideSlant || insideBase;
 
-    // swept guard for fast motion skipping through in one step
+    // swept guard for fast motion skipping through in one step. A single
+    // midpoint sample isn't enough near the apex, where the cone's radius
+    // shrinks to nearly nothing — a point moving fast relative to that
+    // narrow region can cross in and out between the start and the
+    // midpoint alone. Sample several points along prev->pos instead.
     if (!inside) {
-      var ppy = prev[pyI];
-      var midY = (py + ppy) / 2;
-      if (midY >= baseY && midY <= apexY + skin) {
-        var plx = prev[pxI] - cx, plz = prev[pzI] - cz;
-        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
-        var mRadial = Math.sqrt(mlx * mlx + mlz * mlz);
-        if (mRadial < radiusAt(midY) + skin) inside = true;
+      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
+      var SWEEP_SAMPLES = 4;
+      for (var s = 1; s <= SWEEP_SAMPLES && !inside; s++) {
+        var t = s / (SWEEP_SAMPLES + 1);
+        var sx = ppx + (px - ppx) * t;
+        var sy = ppy + (py - ppy) * t;
+        var sz = ppz + (pz - ppz) * t;
+        if (sy < baseY || sy > apexY + skin) continue;
+        var slx = sx - cx, slz = sz - cz;
+        var sRadial = Math.sqrt(slx * slx + slz * slz);
+        if (sRadial < radiusAt(sy) + skin) inside = true;
       }
       if (!inside) return;
     }
@@ -758,7 +979,10 @@
       tearSensitivity: opts.tearSensitivity,
       shear: opts.shear,
       pin: opts.pin != null ? opts.pin : 'top',
-      pinEvery: opts.pinEvery
+      pinEvery: opts.pinEvery,
+      selfCollision: opts.selfCollision,
+      crossCollision: opts.crossCollision,
+      thickness: opts.thickness
     });
 
     // smooth: N (integer >= 2) renders a Catmull-Rom-interpolated mesh
@@ -861,6 +1085,7 @@
   };
 
   TatterMesh.prototype.dispose = function () {
+    this.cloth.disposeCloth();
     this.geometry.dispose();
     if (this.material && this.material.dispose) this.material.dispose();
   };
