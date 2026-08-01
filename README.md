@@ -50,6 +50,18 @@ const colliders = [
 flag.update(colliders, wind);
 ```
 
+Three more collider types beyond the primitives above:
+
+```js
+Tatter.capsuleCollider(myCapsuleMesh); // from THREE.CapsuleGeometry (upright, Y-axis)
+Tatter.planeCollider(myPlaneMesh);     // infinite plane, normal from the mesh's orientation
+Tatter.meshCollider(myCustomMesh);     // any mesh — custom models, loaded GLTFs, decimated proxies
+```
+
+- **`capsuleCollider(mesh)`** — reads `radius`/`length` off `CapsuleGeometry`. If your THREE version lacks `CapsuleGeometry`, or the capsule needs a different orientation, build the collider object by hand instead: `{ type: 'capsule', pointA: {x,y,z}, pointB: {x,y,z}, radius }`.
+- **`planeCollider(mesh, normal)`** — an infinite plane at the mesh's position. `normal` defaults to `{x:0,y:1,z:0}` and is rotated by the mesh's current quaternion, so a rotated `PlaneGeometry` collides along the direction it's actually facing.
+- **`meshCollider(mesh, opts)`** — collides against a mesh's real triangle surface instead of an approximation: custom models, loaded GLTFs, or any non-primitive geometry. World-space triangles are baked into a spatial hash once at call time, not every frame, so it's cheap to collide against repeatedly. `opts.maxTriangles` (default `5000`) caps how many triangles are used — denser meshes are deterministically subsampled; simplify your source geometry (a decimated collision proxy) rather than relying on this as anything but a safety ceiling. For a mesh that moves, rotates, or scales at runtime, call `Tatter.refreshMeshCollider(collider, mesh)` after moving it each frame, rather than rebuilding a new collider from scratch — the collider does not track the source mesh's transform on its own.
+
 Turn collision off for one object at runtime without removing it from the array:
 
 ```js
@@ -78,6 +90,7 @@ someCollider.enabled = false; // cloth passes straight through until re-enabled
 | `pinEvery`                     | `1`                 | With `pin: 'top'`, pin every Nth point along the row                                     |
 | `smooth`                       | `3`                 | Renders a Catmull-Rom-smoothed mesh at N× the physics grid density. Pass `false` or `1` for raw grid-resolution rendering. |
 | `meshSkip`                     | `2`                 | Only resync/re-smooth the visible mesh every Nth `update()` call; physics still steps every call. Raise for more FPS, lower (`1`) for max fidelity. |
+| `cullCamera`                   | `null`              | Opt-in frustum culling. Pass a `THREE.Camera` and `update()` skips BOTH the physics step and mesh sync entirely whenever the cloth's bounding sphere is outside that camera's view — a real cost saving for off-screen cloth, not just a visual one. See **Frustum culling** below. |
 | `color` / `map`                | `0xffffff`          | Material color or texture                                                                 |
 | `roughness` / `metalness`      | `0.65` / `0.05`     | Material PBR params                                                                       |
 | `castShadow` / `receiveShadow` | `true`              | Shadow settings on the generated mesh                                                     |
@@ -125,6 +138,44 @@ const backdrop = Tatter.cloth({ selfCollision: false, crossCollision: false, /* 
 
 `Cloth` instances unregister themselves from the cross-collision registry automatically when you call `dispose()`.
 
+## Shapes (non-rectangular cloth)
+
+By default a cloth is a flat rectangle. Pass `shape` to `Tatter.cloth()` to remap the grid onto any outline or surface instead — the point count (`cols * rows`) stays fixed, but cells outside the shape are marked inactive: permanently pinned in place and skipped when the mesh is rendered, so no stray triangles or flapping geometry show up outside the outline.
+
+```js
+const disc = Tatter.cloth({
+  cols: 30, rows: 30,
+  shape: Tatter.shapes.circle({ radius: 2 }),
+  pin: false
+});
+```
+
+Three ready-made shape functions:
+
+```js
+Tatter.shapes.circle({ radius: 2 });                          // or radiusX/radiusZ for an ellipse
+Tatter.shapes.ring({ outerRadius: 2, innerRadius: 0.8 });      // annulus — a disc with a hole
+Tatter.shapes.polygon({ points: [{x,z}, {x,z}, ...] });        // any outline — star, logo silhouette, custom shape
+```
+
+- `circle` / `ring` take `origin` (world position) plus their radius options.
+- `polygon` needs `points`, an array of 3+ `{x, z}` pairs in normalized -1..1 space, plus `scale` (default `2`, world-unit size) and `origin`. Uses standard even-odd ray casting for point-in-polygon.
+
+You can also write your own shape function directly — `(x, y, cols, rows) => {x, y, z} | null` — for anything the built-ins don't cover, like sampling a surface programmatically.
+
+### Draping onto a custom model
+
+```js
+const cape = Tatter.fromMesh(myCharacterMesh, { offset: 0.05 });
+cape.addTo(scene);
+```
+
+`Tatter.fromMesh(mesh, opts)` builds a cloth whose *starting shape* conforms to a custom `THREE.Mesh`'s actual surface — a cape draped over a character's shoulders, a tarp over irregular terrain, a flag flush against a custom flagpole cap. It works by raycasting straight down (`-Y`) onto the mesh at each grid cell and placing that point at the hit, offset outward along the surface normal by `opts.offset` (default a small gap, so the cloth doesn't immediately register as colliding if you also pass the same mesh in as a collider). Cells that don't hit the surface are left inactive, so an irregular model naturally produces a cloth outline matching its silhouette from above.
+
+This only makes sense for surfaces that are roughly convex from above (terrain, a tabletop, a character's back). For wrap-around draping over a fully enclosed shape, use a normal flat cloth with `Tatter.meshCollider(mesh)` and let it fall and settle dynamically instead — that handles arbitrary topology correctly since it's real physics rather than a one-shot projection.
+
+All other `Tatter.cloth()` options (material, pin, wind, collision) still apply on top of `shape` or `fromMesh` — they only affect the resting outline/topology.
+
 ## Pinning
 
 ```js
@@ -149,6 +200,22 @@ flag.update(colliders, wind);
 ```
 
 Layers a few different-frequency sines per axis plus gust variance so it reads as moving air rather than a metronome. You can still pass a plain `{x,y,z}` object to `update()`/`step()` directly if you want to drive wind yourself.
+
+## Frustum culling
+
+```js
+flag.cullCamera = camera; // opt in — off by default
+flag.update(colliders, wind); // now skips physics+mesh sync when off-screen
+```
+
+When `cullCamera` is set, `update()` checks the cloth's bounding sphere against that camera's view frustum before doing anything else. If the cloth is fully outside the frustum, **both the physics step and the mesh sync are skipped entirely** for that call — the point array is left exactly as it was. This is a real cost saving, not just a visual one: a flag behind the player, a banner in a room the camera isn't looking at, etc. cost nothing per frame while off-screen.
+
+Tradeoffs:
+
+- Cloth motion **freezes** while off-screen rather than continuing to simulate silently — it resumes from wherever it was when it re-enters view, not from where it "would have been." For most cases (why pay for wind/collision on something nobody's looking at?) that's the right call. If you need off-screen cloth to keep animating on a predictable path — e.g. it's about to swing into frame — don't set `cullCamera`, and lean on `meshSkip`/`collisionIterations` for perf instead.
+- The bounding sphere is computed once at construction from the cloth's starting extent, padded generously, and NOT recomputed every frame (recomputing it costs the same point-position scan the physics step already does, which would defeat the purpose). Normal drape/wind motion stays inside the padded sphere. If you reposition the cloth's origin drastically at runtime, call `flag.cloth ? tatterMesh._computeBoundingSphere() : null` yourself afterward (or just re-create the cloth) so culling stays accurate.
+- `camera.matrixWorldInverse` must reflect the camera's current transform. `update()` calls `cullCamera.updateMatrixWorld()` itself, so this works correctly regardless of whether you call `update()` before or after `renderer.render()` in your loop.
+- On re-entering view after being culled, `prev` is snapped to `pos` internally so the cloth doesn't visibly "lurch" from an unsimulated velocity gap — it resumes calmly rather than catching up all at once.
 
 ## Performance
 
@@ -179,6 +246,14 @@ Tatter.boxCollider(mesh);             // build a collider from a THREE.Mesh with
 Tatter.sphereCollider(mesh);          // ...with SphereGeometry
 Tatter.cylinderCollider(mesh);        // ...with CylinderGeometry (upright, Y-axis)
 Tatter.coneCollider(mesh);            // ...with ConeGeometry (apex up, Y-axis)
+Tatter.capsuleCollider(mesh);         // ...with CapsuleGeometry (upright, Y-axis)
+Tatter.planeCollider(mesh, normal);   // infinite plane at the mesh's position/orientation
+Tatter.meshCollider(mesh, opts);      // any mesh's real triangle surface, spatial-hashed
+Tatter.refreshMeshCollider(col, mesh, maxTriangles); // re-bake a meshCollider after moving/rotating/scaling it
+Tatter.shapes.circle(opts);           // non-rectangular cloth outline: disc/ellipse — see Shapes above
+Tatter.shapes.ring(opts);             // ...annulus (disc with a hole)
+Tatter.shapes.polygon(opts);          // ...arbitrary outline from points
+Tatter.fromMesh(mesh, opts);          // cloth shaped by raycasting onto a custom model's surface
 Tatter.wind(t, opts);                 // turbulent air wind force generator, see Wind above
 ```
 
