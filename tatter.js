@@ -86,7 +86,15 @@
   // so it neither vanishes on tiny colliders nor overshoots on huge
   // ones. Call skinFor(col, refSize) at each resolver's collision
   // point rather than reading one shared global.
-  var COLLISION_SKIN_MIN = 0.008; // floor, so it never fully vanishes and corners still get a little smoothing
+  // FIX (z-fighting on flush faces): the old floor (0.008) was tuned only
+  // for "smooths corner jitter" and didn't account for depth-buffer /
+  // camera-distance precision — a cloth point resting exactly 0.008 units
+  // off a box face is well within z-fighting range at normal camera
+  // distances, so flat cloth draped over a box visibly flickered against
+  // the box's own surface. Raised enough to reliably clear that without
+  // being visually thick (still under a third of the old fraction-based
+  // value for a 1-unit collider).
+  var COLLISION_SKIN_MIN = 0.02;  // floor — clears typical z-fighting distance
   var COLLISION_SKIN_MAX = 0.05;  // ceiling, so even a huge collider doesn't get a coarse-looking margin
   var COLLISION_SKIN_FRACTION = 0.03; // ~3% of the collider's own reference size
   function skinFor(refSize) {
@@ -1258,6 +1266,21 @@
       var xClose = ox - minO < minO * 0.35;
       var yClose = oy - minO < minO * 0.35;
       var zClose = oz - minO < minO * 0.35;
+      // FIX (rounded/beveled-looking box corners + z-fighting): two bugs
+      // here previously. (1) cxp/cyp/czp clamped to ±hx/±hy/±hz (already
+      // skin-inclusive) and then this block added skin AGAIN along the
+      // diagonal normal below — over-shooting clearance at corners
+      // relative to flat faces (soft "bevel" look). (2) A later attempt
+      // to fix that by clamping to the true half-extent (no skin) and
+      // still adding skin along the diagonal normal under-delivers: skin
+      // added along a 45°-ish diagonal direction only contributes
+      // skin/sqrt(2) per axis at a true 3-axis corner, landing the point
+      // INSIDE the surface relative to a flat face's full-skin depth —
+      // the opposite error. The actually-correct fix: clamp straight to
+      // hx/hy/hz (skin baked in) as the FINAL resting position, with no
+      // further offset — identical in spirit to the flat-face branches
+      // below, which also just clamp to hx/hy/hz directly. This makes
+      // rest depth exactly uniform across faces, edges, and corners.
       var cxp = xClose ? (lx < 0 ? -hx : hx) : lx;
       var cyp = yClose ? (ly < 0 ? -hy : hy) : ly;
       var czp = zClose ? (lz < 0 ? -hz : hz) : lz;
@@ -1271,9 +1294,9 @@
         else { nz = lz < 0 ? -1 : 1; pos[pzI] = cz + nz * hz; }
       } else {
         nx = ddx / dlen; ny = ddy / dlen; nz = ddz / dlen;
-        pos[pxI] = cx + cxp + nx * skin;
-        pos[pyI] = cy + cyp + ny * skin;
-        pos[pzI] = cz + czp + nz * skin;
+        pos[pxI] = cx + cxp;
+        pos[pyI] = cy + cyp;
+        pos[pzI] = cz + czp;
       }
     } else if (ox < oy && ox < oz) {
       nx = lx < 0 ? -1 : 1;
