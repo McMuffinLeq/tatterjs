@@ -44,7 +44,7 @@ flag.update(colliders, wind);
 `tatter.esm.js` is a thin ESM entry point that loads `tatter.js` (the one real implementation) and re-exports the resulting global, so there's nothing to keep in sync between builds:
 
 ```js
-import Tatter from "https://cdn.jsdelivr.net/gh/McMuffinLeq/tatterjs@v1.0.4/tatter.esm.js";
+import Tatter from "https://cdn.jsdelivr.net/gh/McMuffinLeq/tatterjs@v1.0.5/tatter.esm.js";
 
 const flag = Tatter.cloth({ cols: 16, rows: 16, spacing: 0.25 });
 ```

@@ -1,6 +1,6 @@
 // tatter.esm.js
 // ES module entry point for Tatter.js — for use with:
-//   import Tatter from "https://cdn.jsdelivr.net/gh/McMuffinLeq/tatterjs@v1.0.4/tatter.esm.js";
+//   import Tatter from "https://cdn.jsdelivr.net/gh/McMuffinLeq/tatterjs@v1.0.5/tatter.esm.js";
 //
 // This just loads the existing UMD build (tatter.js) and re-exports it,
 // so there is only one real implementation to maintain. Everyone else
