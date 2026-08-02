@@ -1,3 +1,6 @@
+THIS PROJECT IS SCRAPPED BECAUSE I CANT FIX THIS GLITCH.
+
+
 # Tatter.js
 
 Fabric physics for Three.js. Verlet-integration cloth simulation in a single JS file — give it a scene, get back a mesh with real gravity, wind, pinning, tearing, self-collision, and collision against boxes, spheres, cylinders, cones, capsules, planes, and arbitrary meshes.
