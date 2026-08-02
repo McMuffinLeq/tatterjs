@@ -18,6 +18,40 @@
 })(this, function () {
   'use strict';
 
+  // ---- collider motion tracking, keyed by the collider's `pos` object ----
+  // FIX (silent tunneling regression): swept-collision tests need to know
+  // how far a collider moved since last frame. The original approach
+  // stashed `_prevPos` directly on the collider object returned by
+  // boxCollider()/sphereCollider()/etc. That works ONLY if the caller
+  // reuses the same collider object across frames — but the natural,
+  // common pattern (and the one used in this library's own example
+  // scenes) is to call `Tatter.boxCollider(mesh)` fresh every frame,
+  // since primitive colliders are meant to be cheap to rebuild. A fresh
+  // object has no `_prevPos`, so it's reset to the CURRENT position every
+  // single frame, the computed delta is always zero, and the fast-mover
+  // tunneling guard silently does nothing — exactly the corner/edge
+  // clipping this was meant to prevent.
+  //
+  // Fix: track previous position in a WeakMap keyed by `col.pos` itself
+  // (e.g. a THREE.Mesh's `.position` object) rather than by the
+  // collider wrapper. `col.pos` is the one thing that IS stable across
+  // frames even when the wrapping collider object is rebuilt, since it's
+  // normally just `mesh.position` — the same live reference every call.
+  var _colliderPrevPos = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+  function _trackColliderDelta(col) {
+    var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
+    if (!_colliderPrevPos) return { dx: 0, dy: 0, dz: 0 };
+    var key = col.pos;
+    var prev = _colliderPrevPos.get(key);
+    if (!prev) {
+      _colliderPrevPos.set(key, { x: cx, y: cy, z: cz });
+      return { dx: 0, dy: 0, dz: 0 };
+    }
+    var dx = cx - prev.x, dy = cy - prev.y, dz = cz - prev.z;
+    prev.x = cx; prev.y = cy; prev.z = cz;
+    return { dx: dx, dy: dy, dz: dz };
+  }
+
   function resolveThree(explicit) {
     var THREE = explicit || (typeof window !== 'undefined' ? window.THREE : null);
     if (!THREE) {
@@ -32,13 +66,38 @@
    * attaches the mesh for you.
    */
   // Collision skin margin — extra buffer distance kept between cloth
-  // points and box/sphere/cylinder/cone collider surfaces. This is what
-  // prevents visible corner/edge clipping (the same fix Blender calls
-  // "Min Distance" on its cloth collision panel). Fixed as part of the
-  // physics itself, not a per-cloth option — tuned once against real
-  // corner-penetration cases and intentionally not exposed for tuning,
-  // since a wrong value here reintroduces visible clipping.
-  var COLLISION_SKIN = 0.16;
+  // points and box/sphere/cylinder/cone collider surfaces, to smooth
+  // out corner/edge push-out jitter (the same idea as Blender's "Min
+  // Distance" on its cloth collision panel).
+  //
+  // FIX (visible gap / inaccurate collision): this was previously a
+  // FLAT constant (0.16 world units) added to every collider's size,
+  // regardless of the collider's own scale. That's fine for a large
+  // object where 0.16 is imperceptible, but for a small-to-medium
+  // object (e.g. a 1.4-unit box, half-width 0.7) it added roughly 20%+
+  // to the effective collision size — cloth would visibly react to
+  // empty space well before the real surface, reading as "the cloth is
+  // colliding with something that isn't there yet." A margin meant only
+  // to smooth corner jitter should never be a large fraction of the
+  // object it's wrapping.
+  //
+  // Fixed to scale with each collider's own size: a small fraction of
+  // its smallest relevant dimension, clamped to a sane absolute range
+  // so it neither vanishes on tiny colliders nor overshoots on huge
+  // ones. Call skinFor(col, refSize) at each resolver's collision
+  // point rather than reading one shared global.
+  var COLLISION_SKIN_MIN = 0.008; // floor, so it never fully vanishes and corners still get a little smoothing
+  var COLLISION_SKIN_MAX = 0.05;  // ceiling, so even a huge collider doesn't get a coarse-looking margin
+  var COLLISION_SKIN_FRACTION = 0.03; // ~3% of the collider's own reference size
+  function skinFor(refSize) {
+    var s = Math.abs(refSize) * COLLISION_SKIN_FRACTION;
+    if (s < COLLISION_SKIN_MIN) return COLLISION_SKIN_MIN;
+    if (s > COLLISION_SKIN_MAX) return COLLISION_SKIN_MAX;
+    return s;
+  }
+  // kept for any external code still referencing the old constant name;
+  // no longer used internally by the resolvers below.
+  var COLLISION_SKIN = COLLISION_SKIN_MIN;
 
   function Cloth(opts) {
     this.cols = opts.cols;
@@ -74,8 +133,18 @@
     // sheet) and, when crossCollision is on, through OTHER Tatter cloths
     // in the scene too. Off by default costs nothing; on, it's an
     // additional spatial-hash pass alongside collider resolution.
-    this.selfCollision = opts.selfCollision !== false;
-    this.crossCollision = opts.crossCollision !== false;
+    //
+    // FIX (perf): this previously defaulted to ON (`opts.selfCollision
+    // !== false`), contradicting this very comment and silently costing
+    // every scene an extra O(n) spatial-hash pass per frame even for a
+    // simple single sheet that never folds onto itself — typically the
+    // single biggest avoidable cost in step(). Most cloth (a flag, a
+    // curtain, a sheet draped over/around a moving shape) doesn't need
+    // self-collision at all; opt in explicitly with `selfCollision: true`
+    // / `crossCollision: true` if your cloth actually folds over itself
+    // or needs to interact with other Tatter cloths in the scene.
+    this.selfCollision = opts.selfCollision === true;
+    this.crossCollision = opts.crossCollision === true;
     // minimum allowed distance between two non-adjacent points before
     // they're pushed apart — defaults to a fraction of point spacing,
     // since that's the natural "thickness" scale of this grid
@@ -541,7 +610,7 @@
   // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
   Cloth.prototype._resolveSphere = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = skinFor(col.radius), friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -552,7 +621,15 @@
     if (distSq >= r * r) {
       // swept guard: sample several points along prev->pos so a fast-moving
       // point can't skip clean through the sphere in one step (a single
-      // midpoint sample can still miss on a sharp near-tangent pass)
+      // midpoint sample can still miss on a sharp near-tangent pass).
+      // Also expand the effective radius by how far the SPHERE ITSELF
+      // moved this frame — a fast-moving collider can displace by more
+      // than its own radius in one step, which the point-only sampling
+      // above can't catch on its own (same root cause as the box
+      // tunneling bug: fast collider motion, not just fast point motion).
+      var colDelta = _trackColliderDelta(col);
+      var colMoveMag = Math.sqrt(colDelta.dx * colDelta.dx + colDelta.dy * colDelta.dy + colDelta.dz * colDelta.dz);
+      var sweptR = r + colMoveMag;
       var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
       var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
       var hitSphere = false;
@@ -562,7 +639,7 @@
         var sx = (ppx + (px0 - ppx) * st) - cx;
         var sy = (ppy + (py0 - ppy) * st) - cy;
         var sz = (ppz + (pz0 - ppz) * st) - cz;
-        if (sx * sx + sy * sy + sz * sz < r * r) hitSphere = true;
+        if (sx * sx + sy * sy + sz * sz < sweptR * sweptR) hitSphere = true;
       }
       if (!hitSphere) return;
     }
@@ -581,7 +658,7 @@
   // axis-aligned to Y (upright), pos is the center ----
   Cloth.prototype._resolveCylinder = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = skinFor(col.radius), friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -594,18 +671,24 @@
 
     // swept tunneling guard: sample several points along prev->pos so
     // fast motion can't skip through the cylinder entirely — a single
-    // midpoint sample can still miss near the rim/cap edges
+    // midpoint sample can still miss near the rim/cap edges. Also
+    // account for the CYLINDER's own motion this frame (same root
+    // cause as the box/sphere tunneling fixes: a fast-moving collider,
+    // not just a fast-moving point, can skip past a point-only test).
     if (!inside) {
+      var colDelta = _trackColliderDelta(col);
+      var sweptR = r + Math.sqrt(colDelta.dx * colDelta.dx + colDelta.dz * colDelta.dz);
+      var sweptHalfH = halfH + Math.abs(colDelta.dy);
       var ppx = prev[pxI], ppy2 = prev[pyI], ppz = prev[pzI];
       var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
       var CYL_SAMPLES = 4;
       for (var cs = 1; cs <= CYL_SAMPLES && !inside; cs++) {
         var ct = cs / (CYL_SAMPLES + 1);
         var sy = (ppy2 + (py0 - ppy2) * ct) - cy;
-        if (Math.abs(sy) >= halfH) continue;
+        if (Math.abs(sy) >= sweptHalfH) continue;
         var sx = (ppx + (px0 - ppx) * ct) - cx;
         var sz = (ppz + (pz0 - ppz) * ct) - cz;
-        if (sx * sx + sz * sz < r * r) inside = true;
+        if (sx * sx + sz * sz < sweptR * sweptR) inside = true;
       }
       if (!inside) return;
     }
@@ -655,7 +738,7 @@
   // at pos.y + height/2 ----
   Cloth.prototype._resolveCone = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = skinFor(col.radius), friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var baseR = col.radius, h = col.height;
@@ -743,7 +826,7 @@
   // full mesh collider ----
   Cloth.prototype._resolveCapsule = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = skinFor(col.radius), friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var ax = col.pointA.x, ay = col.pointA.y, az = col.pointA.z;
     var bx = col.pointB.x, by = col.pointB.y, bz = col.pointB.z;
@@ -799,7 +882,7 @@
   // useful for ramps, walls, or a tilted table edge ----
   Cloth.prototype._resolvePlaneCollider = function (p, col) {
     var pos = this.pos;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = skinFor(0), friction = this.collisionFriction; // infinite plane has no natural size to scale against — use the floor margin
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var nx = col.normal.x, ny = col.normal.y, nz = col.normal.z;
     var nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
@@ -828,13 +911,27 @@
   // (inside the shape) so concave dips resolve outward correctly too.
   Cloth.prototype._resolveMesh = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    // scale skin to the mesh collider's own bounding-box size (smallest
+    // dimension), same reasoning as the primitive resolvers below —
+    // was previously the flat COLLISION_SKIN constant, which visibly
+    // over- or under-sized the margin for meshes far from that
+    // constant's original reference scale.
+    var refSize = 0.3;
+    if (col.bounds) {
+      var b = col.bounds;
+      refSize = Math.min(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z) / 2;
+    }
+    var skin = skinFor(refSize), friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
 
     var hit = this._closestOnMeshCollider(col, pos[pxI], pos[pyI], pos[pzI]);
     if (!hit) return;
 
-    var inside = hit.distSq < (col.radius0 || 0) || hit.signedDist < skin;
+    // NOTE: this previously also checked `hit.distSq < (col.radius0 ||
+    // 0)`, but col.radius0 was never assigned anywhere in this file —
+    // that branch was permanently dead (always compared against 0).
+    // Dropped it; the signedDist check below is the real, working test.
+    var inside = hit.signedDist < skin;
 
     if (!inside) {
       // swept guard: a fast-moving point can hop clean past a thin custom
@@ -1018,12 +1115,12 @@
 
   Cloth.prototype._resolveBox = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN;
+    var half = col.half;
+    var skin = skinFor(Math.min(half.x, half.y, half.z));
     var friction = this.collisionFriction;
 
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
 
-    var half = col.half;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
 
     var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
@@ -1038,16 +1135,17 @@
     // half-width in one step — the point can end up "outside" the box
     // at both the old and new collider position, so the point-only
     // swept test never sees a crossing at all and cloth clips straight
-    // through. Track each collider's own previous-frame position (set
-    // once via _prevPos, keyed by the collider object itself) and fold
-    // that displacement into the effective half-extents used for the
-    // swept test, so a fast-moving box is also covered, not just a
-    // fast-moving point. This only affects the SWEPT test region — the
-    // final resting push-out below still uses the true hx/hy/hz.
-    if (!col._prevPos) col._prevPos = { x: cx, y: cy, z: cz };
-    var colDx = cx - col._prevPos.x, colDy = cy - col._prevPos.y, colDz = cz - col._prevPos.z;
-    var shx = hx + Math.abs(colDx), shy = hy + Math.abs(colDy), shz = hz + Math.abs(colDz);
-    col._prevPos.x = cx; col._prevPos.y = cy; col._prevPos.z = cz;
+    // through. Track the collider's previous-frame position (keyed by
+    // the stable col.pos reference, e.g. mesh.position — NOT by the
+    // collider wrapper object, since that's commonly rebuilt fresh every
+    // frame by callers, which silently defeated this exact fix before)
+    // and fold that displacement into the effective half-extents used
+    // for the swept test, so a fast-moving box is also covered, not
+    // just a fast-moving point. This only affects the SWEPT test
+    // region — the final resting push-out below still uses the true
+    // hx/hy/hz.
+    var colDelta = _trackColliderDelta(col);
+    var shx = hx + Math.abs(colDelta.dx), shy = hy + Math.abs(colDelta.dy), shz = hz + Math.abs(colDelta.dz);
 
     var lx = px - cx, ly = py - cy, lz = pz - cz;
     var inside = Math.abs(lx) < hx && Math.abs(ly) < hy && Math.abs(lz) < hz;
