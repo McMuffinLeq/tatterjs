@@ -308,6 +308,33 @@
     var wy = wind ? (wind.y || 0) : 0;
     var wz = wind ? (wind.z || 0) : 0;
 
+    // FIX (corner tunneling regression): compute each collider's
+    // frame-to-frame motion delta exactly ONCE here, before any point
+    // is resolved against it, and stash the result on the collider
+    // object as `_frameDelta` for the rest of this step() call to read.
+    //
+    // Previously each resolver (_resolveBox, _resolveSphere, etc.)
+    // called _trackColliderDelta(col) itself, directly inline during
+    // collision resolution — which runs once per POINT, per collision
+    // ITERATION, and (for box/mesh) TWICE per call for extra corner
+    // correction. That's potentially thousands of calls to
+    // _trackColliderDelta within a single step(), and that function
+    // immediately overwrites its stored "previous position" on every
+    // call — so only the very FIRST call anywhere in the whole frame
+    // ever saw a real nonzero delta; every other call that frame saw
+    // delta ≈ 0, silently disabling the fast-mover tunneling guard for
+    // the rest of the frame. This was most visible at box corners
+    // specifically because _resolveBox's second (corner-cleanup) call
+    // always landed after the delta had already been zeroed by the
+    // first, so the extra corner pass had no swept protection at all.
+    if (colliders && colliders.length) {
+      for (var dci = 0; dci < colliders.length; dci++) {
+        var dcol = colliders[dci];
+        if (dcol.enabled === false || !dcol.pos) continue;
+        dcol._frameDelta = _trackColliderDelta(dcol);
+      }
+    }
+
     for (var i = 0; i < n; i++) {
       if (pinned[i]) continue;
       var ix = i * 3, iy = ix + 1, iz = ix + 2;
@@ -626,8 +653,11 @@
       // moved this frame — a fast-moving collider can displace by more
       // than its own radius in one step, which the point-only sampling
       // above can't catch on its own (same root cause as the box
-      // tunneling bug: fast collider motion, not just fast point motion).
-      var colDelta = _trackColliderDelta(col);
+      // tunneling bug: fast collider motion, not just fast point
+      // motion). Delta is computed ONCE per frame in step(), not here —
+      // see the _resolveBox comment for why recomputing it per-call
+      // was silently broken.
+      var colDelta = col._frameDelta || { dx: 0, dy: 0, dz: 0 };
       var colMoveMag = Math.sqrt(colDelta.dx * colDelta.dx + colDelta.dy * colDelta.dy + colDelta.dz * colDelta.dz);
       var sweptR = r + colMoveMag;
       var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
@@ -676,7 +706,7 @@
     // cause as the box/sphere tunneling fixes: a fast-moving collider,
     // not just a fast-moving point, can skip past a point-only test).
     if (!inside) {
-      var colDelta = _trackColliderDelta(col);
+      var colDelta = col._frameDelta || { dx: 0, dy: 0, dz: 0 };
       var sweptR = r + Math.sqrt(colDelta.dx * colDelta.dx + colDelta.dz * colDelta.dz);
       var sweptHalfH = halfH + Math.abs(colDelta.dy);
       var ppx = prev[pxI], ppy2 = prev[pyI], ppz = prev[pzI];
@@ -1135,16 +1165,15 @@
     // half-width in one step — the point can end up "outside" the box
     // at both the old and new collider position, so the point-only
     // swept test never sees a crossing at all and cloth clips straight
-    // through. Track the collider's previous-frame position (keyed by
-    // the stable col.pos reference, e.g. mesh.position — NOT by the
-    // collider wrapper object, since that's commonly rebuilt fresh every
-    // frame by callers, which silently defeated this exact fix before)
-    // and fold that displacement into the effective half-extents used
-    // for the swept test, so a fast-moving box is also covered, not
-    // just a fast-moving point. This only affects the SWEPT test
-    // region — the final resting push-out below still uses the true
-    // hx/hy/hz.
-    var colDelta = _trackColliderDelta(col);
+    // through. Fold the collider's this-frame displacement (computed
+    // ONCE up front in step(), see _frameDelta there — NOT recomputed
+    // here, which used to silently zero out on every call after the
+    // first one in the frame and broke corner correction specifically)
+    // into the effective half-extents used for the swept test, so a
+    // fast-moving box is also covered, not just a fast-moving point.
+    // This only affects the SWEPT test region — the final resting
+    // push-out below still uses the true hx/hy/hz.
+    var colDelta = col._frameDelta || { dx: 0, dy: 0, dz: 0 };
     var shx = hx + Math.abs(colDelta.dx), shy = hy + Math.abs(colDelta.dy), shz = hz + Math.abs(colDelta.dz);
 
     var lx = px - cx, ly = py - cy, lz = pz - cz;
