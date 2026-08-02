@@ -94,12 +94,28 @@
   // the box's own surface. Raised enough to reliably clear that without
   // being visually thick (still under a third of the old fraction-based
   // value for a 1-unit collider).
-  var COLLISION_SKIN_MIN = 0.02;  // floor — clears typical z-fighting distance
+  var COLLISION_SKIN_MIN = 0.02;  // floor — clears typical z-fighting distance, but see FIX below
   var COLLISION_SKIN_MAX = 0.05;  // ceiling, so even a huge collider doesn't get a coarse-looking margin
   var COLLISION_SKIN_FRACTION = 0.03; // ~3% of the collider's own reference size
+  // FIX (visible rounded/beveled corners on small colliders): COLLISION_SKIN_MIN
+  // is a FLAT floor, so on a small collider (e.g. half-size 0.1-0.2, common for
+  // props sized to match typical cloth `spacing`) it stopped being "a tiny
+  // z-fighting buffer" and became 10-20%+ of the object's own size. Because skin
+  // is added uniformly in every direction — including diagonally at edges and
+  // corners — a uniform pad around a cuboid is a Minkowski sum of a box and a
+  // sphere, i.e. an actual rounded box. That uniform padding, not the corner
+  // push-out math (already correct, see _resolveBox's nearCorner branch), is
+  // what produces a residual bevel look on small colliders. The z-fighting floor
+  // is still real and still needed on flush faces, so it can't just be removed —
+  // instead it now also scales down for small colliders, capped at a fraction of
+  // refSize, so it never exceeds ~6% of the collider's own reference size
+  // regardless of how small the object is.
+  var COLLISION_SKIN_MIN_FRACTION = 0.06;
   function skinFor(refSize) {
-    var s = Math.abs(refSize) * COLLISION_SKIN_FRACTION;
-    if (s < COLLISION_SKIN_MIN) return COLLISION_SKIN_MIN;
+    var r = Math.abs(refSize);
+    var s = r * COLLISION_SKIN_FRACTION;
+    var min = Math.min(COLLISION_SKIN_MIN, r * COLLISION_SKIN_MIN_FRACTION);
+    if (s < min) return min;
     if (s > COLLISION_SKIN_MAX) return COLLISION_SKIN_MAX;
     return s;
   }
