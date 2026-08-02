@@ -31,15 +31,6 @@
    * use Tatter.cloth(scene, options) instead, which also builds and
    * attaches the mesh for you.
    */
-  // Collision skin margin — extra buffer distance kept between cloth
-  // points and box/sphere/cylinder/cone collider surfaces. This is what
-  // prevents visible corner/edge clipping (the same fix Blender calls
-  // "Min Distance" on its cloth collision panel). Fixed as part of the
-  // physics itself, not a per-cloth option — tuned once against real
-  // corner-penetration cases and intentionally not exposed for tuning,
-  // since a wrong value here reintroduces visible clipping.
-  var COLLISION_SKIN = 0.16;
-
   function Cloth(opts) {
     this.cols = opts.cols;
     this.rows = opts.rows;
@@ -56,7 +47,7 @@
     // constraint iterations, minimum 3.
     this.collisionIterations = opts.collisionIterations != null
       ? opts.collisionIterations
-      : Math.max(2, Math.round(this.iterations / 4));
+      : Math.max(3, Math.round(this.iterations / 3));
     this.tearSensitivity = opts.tear === false ? 0 : (opts.tearSensitivity || 2.6);
     // stretchiness: 0 = rigid (old behavior, constraints correct at full
     // strength every iteration). Higher = softer/springier — constraints
@@ -69,89 +60,35 @@
       ? Math.max(0, Math.min(0.95, opts.stretchiness))
       : 0.15;
 
-    // point-vs-point thickness collision: keeps cloth from clipping
-    // through itself (folds passing through nearby parts of the same
-    // sheet) and, when crossCollision is on, through OTHER Tatter cloths
-    // in the scene too. Off by default costs nothing; on, it's an
-    // additional spatial-hash pass alongside collider resolution.
-    this.selfCollision = opts.selfCollision !== false;
-    this.crossCollision = opts.crossCollision !== false;
-    // minimum allowed distance between two non-adjacent points before
-    // they're pushed apart — defaults to a fraction of point spacing,
-    // since that's the natural "thickness" scale of this grid
-    this.thickness = opts.thickness != null ? opts.thickness : opts.spacing * 0.85;
-
     var n = this.cols * this.rows;
     this.pos = new Float32Array(n * 3);
     this.prev = new Float32Array(n * 3);
     this.pinned = new Uint8Array(n);
     this.constraints = []; // [iA, iB, restLength, broken(0/1)]
-    // adjacency lookup (built as constraints are added, see
-    // _addConstraint) so self-collision can skip directly-constrained
-    // point pairs, which are expected to be close and shouldn't be
-    // pushed apart by the thickness pass
-    this._adjacencySets = [];
 
     var self = this;
     function idx(x, y) { return y * self.cols + x; }
     this.idx = idx;
 
-    // shape: optional function(x, y, cols, rows) -> {x,y,z} | null.
-    // Lets the grid be remapped onto ANY custom outline or 3D surface
-    // instead of the default flat rectangle — a disc, a star, a draped
-    // surface sampled off a custom model, whatever. Returning null for a
-    // given cell marks it "inactive": it gets no constraints and is
-    // permanently pinned in place at the origin, effectively removing it
-    // from the simulated shape without changing the fixed cols*rows
-    // point-count layout everything else in this file assumes. See
-    // Tatter.shapes.* and TatterMesh.fromMesh() for ready-made shape
-    // functions covering the common cases.
-    var shapeFn = typeof opts.shape === 'function' ? opts.shape : null;
-    this.active = shapeFn ? new Uint8Array(this.cols * this.rows) : null;
-
     for (var y = 0; y < this.rows; y++) {
       for (var x = 0; x < this.cols; x++) {
         var i = idx(x, y);
-        var px, py, pz;
-        if (shapeFn) {
-          var sp = shapeFn(x, y, this.cols, this.rows);
-          if (sp) {
-            this.active[i] = 1;
-            px = sp.x; py = sp.y; pz = sp.z;
-          } else {
-            // inactive cell: park it at the grid origin and pin it so it
-            // never moves or gets rendered as flapping fabric; syncGeometry
-            // below simply won't draw triangles that touch it (see
-            // buildGeometry's active-aware indexing)
-            px = this.origin.x; py = this.origin.y; pz = this.origin.z;
-          }
-        } else {
-          px = this.origin.x + x * this.spacing;
-          py = this.origin.y;
-          pz = this.origin.z + y * this.spacing;
-        }
+        var px = this.origin.x + x * this.spacing;
+        var py = this.origin.y;
+        var pz = this.origin.z + y * this.spacing;
         this.pos[i * 3] = px; this.pos[i * 3 + 1] = py; this.pos[i * 3 + 2] = pz;
         this.prev[i * 3] = px; this.prev[i * 3 + 1] = py; this.prev[i * 3 + 2] = pz;
-        if (shapeFn && !this.active[i]) this.pinned[i] = 1;
       }
     }
 
-    // helper: is a cell active (part of the shape)? Always true when no
-    // shape function was given (plain rectangular cloth, unchanged behavior)
-    function cellActive(x, y) {
-      return !self.active || self.active[idx(x, y)];
-    }
-    this.cellActive = cellActive;
-
     for (var y2 = 0; y2 < this.rows; y2++) {
       for (var x2 = 0; x2 < this.cols; x2++) {
-        if (!cellActive(x2, y2)) continue;
-        if (x2 < this.cols - 1 && cellActive(x2 + 1, y2)) this._addConstraint(idx(x2, y2), idx(x2 + 1, y2));
-        if (y2 < this.rows - 1 && cellActive(x2, y2 + 1)) this._addConstraint(idx(x2, y2), idx(x2, y2 + 1));
+        if (x2 < this.cols - 1) this._addConstraint(idx(x2, y2), idx(x2 + 1, y2));
+        if (y2 < this.rows - 1) this._addConstraint(idx(x2, y2), idx(x2, y2 + 1));
         // shear constraints — keeps the mesh from collapsing into a diamond, reads as real fabric
         if (opts.shear !== false && x2 < this.cols - 1 && y2 < this.rows - 1) {
-          if (cellActive(x2 + 1, y2 + 1)) this._addConstraint(idx(x2, y2), idx(x2 + 1, y2 + 1));
-          if (cellActive(x2 + 1, y2) && cellActive(x2, y2 + 1)) this._addConstraint(idx(x2 + 1, y2), idx(x2, y2 + 1));
+          this._addConstraint(idx(x2, y2), idx(x2 + 1, y2 + 1));
+          this._addConstraint(idx(x2 + 1, y2), idx(x2, y2 + 1));
         }
       }
     }
@@ -169,15 +106,7 @@
         }
       }
     }
-
-    // register with the global active-cloth list so other cloths can
-    // find and collide against this one (crossCollision). See dispose().
-    Cloth._active.push(this);
   }
-
-  // global list of live Cloth instances, used for crossCollision so one
-  // cloth can find and push against every other cloth currently in play
-  Cloth._active = [];
 
   Cloth.prototype._addConstraint = function (a, b) {
     var ax = this.pos[a * 3], ay = this.pos[a * 3 + 1], az = this.pos[a * 3 + 2];
@@ -185,17 +114,6 @@
     var dx = bx - ax, dy = by - ay, dz = bz - az;
     var len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     this.constraints.push([a, b, len, 0]);
-    // adjacency set used by self-collision to skip pairs that are
-    // supposed to be close together (directly connected by a constraint)
-    (this._adjacencySets[a] || (this._adjacencySets[a] = {}))[b] = 1;
-    (this._adjacencySets[b] || (this._adjacencySets[b] = {}))[a] = 1;
-  };
-
-  /** Stop simulating and remove this cloth from the crossCollision registry.
-   *  TatterMesh.dispose() calls this for you. */
-  Cloth.prototype.disposeCloth = function () {
-    var i = Cloth._active.indexOf(this);
-    if (i !== -1) Cloth._active.splice(i, 1);
   };
 
   Cloth.prototype.pinRow = function (rowIndex, every) {
@@ -296,27 +214,6 @@
       if (iter >= collisionStartIter && ((colliders && colliders.length) || floorY != null)) {
         this._resolveColliders(colliders || [], floorY);
       }
-      // thickness collision: stops fabric from clipping through itself
-      // (self-folding) and, if other Tatter cloths are active, through
-      // them too. Also only needs the last few iterations — it's a
-      // correction pass, same reasoning as collider resolution above.
-      if (iter >= collisionStartIter && (this.selfCollision || this.crossCollision)) {
-        this._resolveThickness();
-      }
-    }
-
-    // BUGFIX: _resolveThickness (self/cross-cloth collision) runs AFTER
-    // collider resolution every iteration above, and it has zero
-    // awareness of colliders — it only pushes points apart based on
-    // fabric-to-fabric distance. That means it can shove a point that
-    // was just correctly resolved against a box corner back inside the
-    // box, on the very last iteration, with nothing after it to catch
-    // the re-penetration — this is what read as "clipping through
-    // corners": the corner push-out logic was firing and computing the
-    // right answer, then getting silently overwritten. Give colliders
-    // the guaranteed last word with one final pass.
-    if ((colliders && colliders.length) || floorY != null) {
-      this._resolveColliders(colliders || [], floorY);
     }
   };
 
@@ -341,207 +238,15 @@
         if (type === 'sphere') this._resolveSphere(p, col);
         else if (type === 'cylinder') this._resolveCylinder(p, col);
         else if (type === 'cone') this._resolveCone(p, col);
-        else if (type === 'capsule') this._resolveCapsule(p, col);
-        else if (type === 'plane') this._resolvePlaneCollider(p, col);
-        else if (type === 'mesh') {
-          // arbitrary shape / custom model: same "resolve twice" treatment
-          // as box, for the same reason — closest-triangle push-out can
-          // undershoot on a single pass near sharp features (corners of a
-          // custom model are just as common as box corners).
-          this._resolveMesh(p, col);
-          this._resolveMesh(p, col);
-        }
-        else {
-          // box: corner/edge penetration can be deep enough that a
-          // single push-out (sized by `skin`) undershoots and leaves a
-          // small residual overlap — literature on cloth collision
-          // consistently notes that even slightly-under-resolved
-          // penetration is visible as a lingering clip. Re-run once
-          // more immediately so a corner point gets a second, smaller
-          // corrective pass against its now-closer-to-correct position
-          // in the same frame, instead of waiting for the next
-          // iteration (which structural constraints could disturb
-          // again before collision gets another turn).
-          this._resolveBox(p, col);
-          this._resolveBox(p, col);
-        }
+        else this._resolveBox(p, col);
       }
     }
-  };
-
-  // ---- thickness collision: point-vs-point repulsion so cloth doesn't
-  // clip through itself (self-collision) or through other active Tatter
-  // cloths (crossCollision). Uses a spatial hash so it stays roughly
-  // O(n) instead of testing every pair — only points that land in the
-  // same or neighboring grid cell are ever compared.
-  Cloth.prototype._buildSpatialHash = function () {
-    var n = this.cols * this.rows;
-    var pos = this.pos;
-    var cell = this.thickness || this.spacing;
-    var map = {};
-    for (var i = 0; i < n; i++) {
-      var ix = i * 3;
-      var cx = Math.floor(pos[ix] / cell);
-      var cy = Math.floor(pos[ix + 1] / cell);
-      var cz = Math.floor(pos[ix + 2] / cell);
-      var key = cx + ',' + cy + ',' + cz;
-      (map[key] || (map[key] = [])).push(i);
-    }
-    this._hashCell = cell;
-    return map;
-  };
-
-  Cloth.prototype._resolveThickness = function () {
-    var n = this.cols * this.rows;
-    var pos = this.pos, pinned = this.pinned;
-    var cell = this.thickness || this.spacing;
-    var minDist = this.thickness;
-    var minDistSq = minDist * minDist;
-    var adjacency = this._adjacencySets || [];
-
-    var selfMap = this.selfCollision ? this._buildSpatialHash() : null;
-
-    // gather other active cloths AND pre-build each of their spatial
-    // hashes ONCE per call (not once per point!). The old code called
-    // other._buildSpatialHash() inside the per-point loop below, which
-    // rebuilt a full O(n) hash for every point on this cloth times every
-    // other cloth times every collision iteration — by far the biggest
-    // cost in the whole step for any scene with crossCollision on and
-    // more than one cloth. The other cloth's points don't move between
-    // those rebuilds within a single _resolveThickness() call, so one
-    // hash per other-cloth per call is correct and dramatically cheaper.
-    var others = null;
-    var othersHashes = null;
-    if (this.crossCollision) {
-      others = [];
-      othersHashes = [];
-      for (var oc = 0; oc < Cloth._active.length; oc++) {
-        var otherCloth = Cloth._active[oc];
-        if (otherCloth !== this) {
-          others.push(otherCloth);
-          othersHashes.push(otherCloth._buildSpatialHash());
-        }
-      }
-    }
-
-    for (var p = 0; p < n; p++) {
-      var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
-      var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
-      var pPinned = pinned[p];
-
-      var cx = Math.floor(px / cell);
-      var cy = Math.floor(py / cell);
-      var cz = Math.floor(pz / cell);
-
-      // self-collision: check the 27 neighboring cells in this cloth's hash
-      if (selfMap) {
-        for (var dx = -1; dx <= 1; dx++) {
-          for (var dy = -1; dy <= 1; dy++) {
-            for (var dz = -1; dz <= 1; dz++) {
-              var bucket = selfMap[(cx + dx) + ',' + (cy + dy) + ',' + (cz + dz)];
-              if (!bucket) continue;
-              for (var bi = 0; bi < bucket.length; bi++) {
-                var q = bucket[bi];
-                if (q <= p) continue; // each pair handled once
-                if (adjacency[p] && adjacency[p][q]) continue; // structurally connected, expected to be close
-                this._pushApart(p, q, minDist, minDistSq, pPinned, pinned[q]);
-              }
-            }
-          }
-        }
-      }
-
-      // cross-collision: check this cloth's point against nearby points
-      // in every other active cloth, using each other cloth's own
-      // spatial hash (built lazily, cached for this pass) instead of a
-      // brute O(n*m) scan across all of its points.
-      if (others) {
-        for (var oi = 0; oi < others.length; oi++) {
-          var other = others[oi];
-          var opos = other.pos, opinned = other.pinned;
-          var otherCell = other.thickness || other.spacing;
-          var crossMinDist = (minDist + otherCell) * 0.5;
-          var crossMinDistSq = crossMinDist * crossMinDist;
-          var otherHash = othersHashes[oi];
-          var ocx = Math.floor(px / otherCell);
-          var ocy = Math.floor(py / otherCell);
-          var ocz = Math.floor(pz / otherCell);
-          for (var odx = -1; odx <= 1; odx++) {
-            for (var ody = -1; ody <= 1; ody++) {
-              for (var odz = -1; odz <= 1; odz++) {
-                var obucket = otherHash[(ocx + odx) + ',' + (ocy + ody) + ',' + (ocz + odz)];
-                if (!obucket) continue;
-                for (var obi = 0; obi < obucket.length; obi++) {
-                  var oq = obucket[obi];
-                  var oqI = oq * 3;
-                  var ddx = opos[oqI] - px, ddy = opos[oqI + 1] - py, ddz = opos[oqI + 2] - pz;
-                  var dSq = ddx * ddx + ddy * ddy + ddz * ddz;
-                  if (dSq >= crossMinDistSq) continue;
-                  var d, nx2, ny2, nz2;
-                  if (dSq < 1e-12) {
-                    // coincident points: same deterministic fallback as
-                    // self-collision, otherwise they'd stay stuck at
-                    // zero distance forever instead of separating
-                    var seed2 = (p * 928371 + oq * 51749 + oi * 7919) % 1000 / 1000;
-                    var theta2 = seed2 * Math.PI * 2;
-                    var phi2 = ((p ^ oq) % 997) / 997 * Math.PI;
-                    nx2 = Math.sin(phi2) * Math.cos(theta2);
-                    ny2 = Math.cos(phi2);
-                    nz2 = Math.sin(phi2) * Math.sin(theta2);
-                    d = 0;
-                  } else {
-                    d = Math.sqrt(dSq);
-                    nx2 = ddx / d; ny2 = ddy / d; nz2 = ddz / d;
-                  }
-                  var push2 = (crossMinDist - d) * 0.5;
-                  if (!pPinned) { pos[pxI] -= nx2 * push2; pos[pyI] -= ny2 * push2; pos[pzI] -= nz2 * push2; }
-                  if (!opinned[oq]) { opos[oqI] += nx2 * push2; opos[oqI + 1] += ny2 * push2; opos[oqI + 2] += nz2 * push2; }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  };
-
-  // shared pair-separation used by self-collision
-  Cloth.prototype._pushApart = function (p, q, minDist, minDistSq, pPinned, qPinned) {
-    var pos = this.pos;
-    var pxI = p * 3, qxI = q * 3;
-    var dx = pos[qxI] - pos[pxI];
-    var dy = pos[qxI + 1] - pos[pxI + 1];
-    var dz = pos[qxI + 2] - pos[pxI + 2];
-    var distSq = dx * dx + dy * dy + dz * dz;
-    if (distSq >= minDistSq) return;
-    var dist, nx, ny, nz;
-    if (distSq < 1e-12) {
-      // exactly (or near-exactly) coincident points have no defined
-      // direction to separate along — division by dist would be 0/0.
-      // Fall back to a small deterministic offset derived from the point
-      // indices so the pair still separates instead of sitting stuck at
-      // zero distance forever (which is what silently caused visible
-      // clipping in this exact case before).
-      var seed = (p * 928371 + q * 51749) % 1000 / 1000;
-      var theta = seed * Math.PI * 2;
-      var phi = ((p ^ q) % 997) / 997 * Math.PI;
-      nx = Math.sin(phi) * Math.cos(theta);
-      ny = Math.cos(phi);
-      nz = Math.sin(phi) * Math.sin(theta);
-      dist = 0;
-    } else {
-      dist = Math.sqrt(distSq);
-      nx = dx / dist; ny = dy / dist; nz = dz / dist;
-    }
-    var push = (minDist - dist) * 0.5;
-    if (!pPinned) { pos[pxI] -= nx * push; pos[pxI + 1] -= ny * push; pos[pxI + 2] -= nz * push; }
-    if (!qPinned) { pos[qxI] += nx * push; pos[qxI + 1] += ny * push; pos[qxI + 2] += nz * push; }
   };
 
   // ---- sphere collider: { type:'sphere', pos:{x,y,z}, radius } ----
   Cloth.prototype._resolveSphere = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = 0.06, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -550,21 +255,11 @@
     var distSq = lx * lx + ly * ly + lz * lz;
 
     if (distSq >= r * r) {
-      // swept guard: sample several points along prev->pos so a fast-moving
-      // point can't skip clean through the sphere in one step (a single
-      // midpoint sample can still miss on a sharp near-tangent pass)
-      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
-      var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
-      var hitSphere = false;
-      var SPH_SAMPLES = 4;
-      for (var ss = 1; ss <= SPH_SAMPLES && !hitSphere; ss++) {
-        var st = ss / (SPH_SAMPLES + 1);
-        var sx = (ppx + (px0 - ppx) * st) - cx;
-        var sy = (ppy + (py0 - ppy) * st) - cy;
-        var sz = (ppz + (pz0 - ppz) * st) - cz;
-        if (sx * sx + sy * sy + sz * sz < r * r) hitSphere = true;
-      }
-      if (!hitSphere) return;
+      // swept guard: cheap midpoint check against prev->pos segment so
+      // a fast-moving point can't skip clean through the sphere in one step
+      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
+      var mlx = (lx + plx) / 2, mly = (ly + ply) / 2, mlz = (lz + plz) / 2;
+      if (mlx * mlx + mly * mly + mlz * mlz >= r * r) return;
     }
     if (distSq < 1e-12) return;
 
@@ -581,7 +276,7 @@
   // axis-aligned to Y (upright), pos is the center ----
   Cloth.prototype._resolveCylinder = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = 0.06, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var r = col.radius + skin;
@@ -592,20 +287,16 @@
 
     var inside = Math.abs(ly) < halfH && radialSq < r * r;
 
-    // swept tunneling guard: sample several points along prev->pos so
-    // fast motion can't skip through the cylinder entirely — a single
-    // midpoint sample can still miss near the rim/cap edges
+    // swept tunneling guard: cheap approximate check against the previous
+    // position — if we weren't "inside" this frame but the segment from
+    // prev->pos crosses close to the cylinder's radius within its height
+    // band, treat as inside so fast motion can't skip through it entirely
     if (!inside) {
-      var ppx = prev[pxI], ppy2 = prev[pyI], ppz = prev[pzI];
-      var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
-      var CYL_SAMPLES = 4;
-      for (var cs = 1; cs <= CYL_SAMPLES && !inside; cs++) {
-        var ct = cs / (CYL_SAMPLES + 1);
-        var sy = (ppy2 + (py0 - ppy2) * ct) - cy;
-        if (Math.abs(sy) >= halfH) continue;
-        var sx = (ppx + (px0 - ppx) * ct) - cx;
-        var sz = (ppz + (pz0 - ppz) * ct) - cz;
-        if (sx * sx + sz * sz < r * r) inside = true;
+      var plx = prev[pxI] - cx, ply = prev[pyI] - cy, plz = prev[pzI] - cz;
+      var midY = (ly + ply) / 2;
+      if (Math.abs(midY) < halfH) {
+        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
+        if (mlx * mlx + mlz * mlz < r * r) inside = true;
       }
       if (!inside) return;
     }
@@ -655,7 +346,7 @@
   // at pos.y + height/2 ----
   Cloth.prototype._resolveCone = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
+    var skin = 0.06, friction = this.collisionFriction;
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
     var cx = col.pos.x, cy = col.pos.y, cz = col.pos.z;
     var baseR = col.radius, h = col.height;
@@ -681,23 +372,15 @@
 
     var inside = insideSlant || insideBase;
 
-    // swept guard for fast motion skipping through in one step. A single
-    // midpoint sample isn't enough near the apex, where the cone's radius
-    // shrinks to nearly nothing — a point moving fast relative to that
-    // narrow region can cross in and out between the start and the
-    // midpoint alone. Sample several points along prev->pos instead.
+    // swept guard for fast motion skipping through in one step
     if (!inside) {
-      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
-      var SWEEP_SAMPLES = 4;
-      for (var s = 1; s <= SWEEP_SAMPLES && !inside; s++) {
-        var t = s / (SWEEP_SAMPLES + 1);
-        var sx = ppx + (px - ppx) * t;
-        var sy = ppy + (py - ppy) * t;
-        var sz = ppz + (pz - ppz) * t;
-        if (sy < baseY || sy > apexY + skin) continue;
-        var slx = sx - cx, slz = sz - cz;
-        var sRadial = Math.sqrt(slx * slx + slz * slz);
-        if (sRadial < radiusAt(sy) + skin) inside = true;
+      var ppy = prev[pyI];
+      var midY = (py + ppy) / 2;
+      if (midY >= baseY && midY <= apexY + skin) {
+        var plx = prev[pxI] - cx, plz = prev[pzI] - cz;
+        var mlx = (lx + plx) / 2, mlz = (lz + plz) / 2;
+        var mRadial = Math.sqrt(mlx * mlx + mlz * mlz);
+        if (mRadial < radiusAt(midY) + skin) inside = true;
       }
       if (!inside) return;
     }
@@ -737,265 +420,6 @@
     this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
   };
 
-  // ---- capsule collider: { type:'capsule', pointA:{x,y,z}, pointB:{x,y,z}, radius }
-  // a cylinder with hemispherical caps, defined by its central segment —
-  // covers most "rounded" character-limb-style shapes without needing a
-  // full mesh collider ----
-  Cloth.prototype._resolveCapsule = function (p, col) {
-    var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
-    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
-    var ax = col.pointA.x, ay = col.pointA.y, az = col.pointA.z;
-    var bx = col.pointB.x, by = col.pointB.y, bz = col.pointB.z;
-    var r = col.radius + skin;
-
-    var abx = bx - ax, aby = by - ay, abz = bz - az;
-    var abLenSq = abx * abx + aby * aby + abz * abz || 1e-12;
-
-    function closestOnSegment(qx, qy, qz) {
-      var apx = qx - ax, apy = qy - ay, apz = qz - az;
-      var t = (apx * abx + apy * aby + apz * abz) / abLenSq;
-      t = t < 0 ? 0 : (t > 1 ? 1 : t);
-      return { x: ax + abx * t, y: ay + aby * t, z: az + abz * t };
-    }
-
-    var px = pos[pxI], py = pos[pyI], pz = pos[pzI];
-    var cpt = closestOnSegment(px, py, pz);
-    var lx = px - cpt.x, ly = py - cpt.y, lz = pz - cpt.z;
-    var distSq = lx * lx + ly * ly + lz * lz;
-    var inside = distSq < r * r;
-
-    // swept guard, same reasoning as sphere/cylinder above
-    if (!inside) {
-      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
-      var CAP_SAMPLES = 4;
-      for (var s = 1; s <= CAP_SAMPLES && !inside; s++) {
-        var t = s / (CAP_SAMPLES + 1);
-        var sx = ppx + (px - ppx) * t;
-        var sy = ppy + (py - ppy) * t;
-        var sz = ppz + (pz - ppz) * t;
-        var scpt = closestOnSegment(sx, sy, sz);
-        var dx2 = sx - scpt.x, dy2 = sy - scpt.y, dz2 = sz - scpt.z;
-        if (dx2 * dx2 + dy2 * dy2 + dz2 * dz2 < r * r) inside = true;
-      }
-      if (!inside) return;
-      cpt = closestOnSegment(pos[pxI], pos[pyI], pos[pzI]);
-      lx = pos[pxI] - cpt.x; ly = pos[pyI] - cpt.y; lz = pos[pzI] - cpt.z;
-      distSq = lx * lx + ly * ly + lz * lz;
-    }
-    if (distSq < 1e-12) return;
-
-    var dist = Math.sqrt(distSq);
-    var nx = lx / dist, ny = ly / dist, nz = lz / dist;
-    pos[pxI] = cpt.x + nx * r;
-    pos[pyI] = cpt.y + ny * r;
-    pos[pzI] = cpt.z + nz * r;
-
-    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
-  };
-
-  // ---- infinite plane collider: { type:'plane', pos:{x,y,z}, normal:{x,y,z} }
-  // like withFloor()'s Y=const plane, but at any position/orientation —
-  // useful for ramps, walls, or a tilted table edge ----
-  Cloth.prototype._resolvePlaneCollider = function (p, col) {
-    var pos = this.pos;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
-    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
-    var nx = col.normal.x, ny = col.normal.y, nz = col.normal.z;
-    var nlen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-    nx /= nlen; ny /= nlen; nz /= nlen;
-
-    var lx = pos[pxI] - col.pos.x, ly = pos[pyI] - col.pos.y, lz = pos[pzI] - col.pos.z;
-    var d = lx * nx + ly * ny + lz * nz;
-    if (d >= skin) return;
-
-    var push = skin - d;
-    pos[pxI] += nx * push; pos[pyI] += ny * push; pos[pzI] += nz * push;
-    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
-  };
-
-  // ---- generic mesh collider: { type:'mesh', triangles: Float32Array,
-  // pos, quaternion, scale } — collide against ANY shape, including
-  // custom models and arbitrary meshes, not just the hand-coded
-  // primitives above. Build one with Tatter.meshCollider(threeMesh).
-  //
-  // Approach: closest point on the triangle soup (world-space, cached
-  // per-collider so a static model doesn't re-transform every point every
-  // frame — see meshCollider()/refreshMeshCollider() below), spatial-hashed
-  // by triangle centroid so a point only tests nearby triangles instead of
-  // all of them. Push out along the surface normal at that closest point,
-  // with a normal-sign flip if the point is found to be behind the surface
-  // (inside the shape) so concave dips resolve outward correctly too.
-  Cloth.prototype._resolveMesh = function (p, col) {
-    var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN, friction = this.collisionFriction;
-    var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
-
-    var hit = this._closestOnMeshCollider(col, pos[pxI], pos[pyI], pos[pzI]);
-    if (!hit) return;
-
-    var inside = hit.distSq < (col.radius0 || 0) || hit.signedDist < skin;
-
-    if (!inside) {
-      // swept guard: a fast-moving point can hop clean past a thin custom
-      // shape between prev and pos, same failure mode as the primitives
-      var ppx = prev[pxI], ppy = prev[pyI], ppz = prev[pzI];
-      var px0 = pos[pxI], py0 = pos[pyI], pz0 = pos[pzI];
-      var MESH_SAMPLES = 4;
-      for (var s = 1; s <= MESH_SAMPLES && !inside; s++) {
-        var t = s / (MESH_SAMPLES + 1);
-        var sx = ppx + (px0 - ppx) * t;
-        var sy = ppy + (py0 - ppy) * t;
-        var sz = ppz + (pz0 - ppz) * t;
-        var shit = this._closestOnMeshCollider(col, sx, sy, sz);
-        if (shit && shit.signedDist < skin) inside = true;
-      }
-      if (!inside) return;
-      hit = this._closestOnMeshCollider(col, pos[pxI], pos[pyI], pos[pzI]);
-      if (!hit) return;
-    }
-
-    var nx = hit.nx, ny = hit.ny, nz = hit.nz;
-    pos[pxI] = hit.x + nx * skin;
-    pos[pyI] = hit.y + ny * skin;
-    pos[pzI] = hit.z + nz * skin;
-
-    this._dampTangential(pxI, pyI, pzI, nx, ny, nz, friction);
-  };
-
-  // finds the closest point on col's triangle soup to (qx,qy,qz), using
-  // col's spatial hash (built/cached by meshCollider) to only check nearby
-  // triangles. Returns { x,y,z (closest point), nx,ny,nz (outward normal,
-  // sign-corrected), distSq, signedDist } or null if col has no triangles
-  // within search range (shouldn't normally happen for a closed shape).
-  Cloth.prototype._closestOnMeshCollider = function (col, qx, qy, qz) {
-    var hash = col._hash;
-    if (!hash) return null;
-    var cell = col._hashCell;
-    var cx = Math.floor(qx / cell), cy = Math.floor(qy / cell), cz = Math.floor(qz / cell);
-
-    var best = null, bestDistSq = Infinity;
-    // Candidates within this fraction of the best distance are treated as
-    // tied and their normals averaged, rather than keeping only whichever
-    // one happened to be iterated last (hash bucket order is otherwise
-    // arbitrary). This matters most right at shared vertices/edges between
-    // adjacent triangles — the single most common "closest point" case for
-    // any real mesh, since a point is far more likely to land near a seam
-    // than dead-center in a single triangle's interior — where two or more
-    // triangles legitimately tie on distance but disagree on face normal.
-    var TIE_EPS = 1e-6;
-    var accNx = 0, accNy = 0, accNz = 0, tieCount = 0;
-    var bestCp = null, bestSigned = 0;
-
-    // expand the search radius outward one ring at a time until we find
-    // at least one triangle, so points further from the surface than one
-    // cell (e.g. deep tunneling) still resolve instead of silently missing
-    for (var ring = 1; ring <= 3; ring++) {
-      for (var dx = -ring; dx <= ring; dx++) {
-        for (var dy = -ring; dy <= ring; dy++) {
-          for (var dz = -ring; dz <= ring; dz++) {
-            if (ring > 1 && Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz)) < ring) continue;
-            var bucket = hash[(cx + dx) + ',' + (cy + dy) + ',' + (cz + dz)];
-            if (!bucket) continue;
-            for (var bi = 0; bi < bucket.length; bi++) {
-              var tri = bucket[bi];
-              var cp = closestPointOnTriangle(
-                qx, qy, qz,
-                tri.ax, tri.ay, tri.az, tri.bx, tri.by, tri.bz, tri.cx, tri.cy, tri.cz
-              );
-              var ddx = qx - cp.x, ddy = qy - cp.y, ddz = qz - cp.z;
-              var dSq = ddx * ddx + ddy * ddy + ddz * ddz;
-              // signed distance to THIS triangle's plane (dot of the
-              // surface-to-point vector with the face normal): negative
-              // means the query point is on the far/inside side of this
-              // triangle's winding — i.e. penetrating. Used below to
-              // classify inside/outside; the PUSH direction is always the
-              // triangle's own stored normal as-is (assumes consistent
-              // outward winding across the source mesh, same assumption
-              // every other collider here makes about its own geometry).
-              var signedHere = ddx * tri.nx + ddy * tri.ny + ddz * tri.nz;
-              var faceNx = tri.nx, faceNy = tri.ny, faceNz = tri.nz;
-
-              if (dSq < bestDistSq - TIE_EPS) {
-                // clear new winner: reset the tie accumulator to just this one
-                bestDistSq = dSq;
-                bestCp = cp;
-                bestSigned = signedHere;
-                accNx = faceNx; accNy = faceNy; accNz = faceNz; tieCount = 1;
-              } else if (dSq < bestDistSq + TIE_EPS) {
-                // tied with (or marginally closer than) the current best:
-                // fold this triangle's outward normal into the running
-                // average instead of discarding it
-                if (dSq < bestDistSq) { bestDistSq = dSq; bestCp = cp; bestSigned = signedHere; }
-                accNx += faceNx; accNy += faceNy; accNz += faceNz; tieCount++;
-              }
-            }
-          }
-        }
-      }
-      if (tieCount) break;
-    }
-
-    if (!tieCount) return null;
-
-    var alen = Math.sqrt(accNx * accNx + accNy * accNy + accNz * accNz) || 1e-8;
-    var fdlen = Math.sqrt(bestDistSq) || 1e-8;
-    best = {
-      x: bestCp.x, y: bestCp.y, z: bestCp.z,
-      // averaged, renormalized outward normal across all tied triangles —
-      // stable at flat seams (all faces agree, average = same direction)
-      // and gives a sensible blended push-out at genuine creases/corners
-      nx: accNx / alen, ny: accNy / alen, nz: accNz / alen,
-      distSq: bestDistSq,
-      signedDist: bestSigned < 0 ? -fdlen : fdlen
-    };
-    return best;
-  };
-
-  // closest point on triangle ABC to point P — standard region-test
-  // implementation (Ericson, "Real-Time Collision Detection" 5.1.5)
-  function closestPointOnTriangle(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
-    var abx = bx - ax, aby = by - ay, abz = bz - az;
-    var acx = cx - ax, acy = cy - ay, acz = cz - az;
-    var apx = px - ax, apy = py - ay, apz = pz - az;
-
-    var d1 = abx * apx + aby * apy + abz * apz;
-    var d2 = acx * apx + acy * apy + acz * apz;
-    if (d1 <= 0 && d2 <= 0) return { x: ax, y: ay, z: az };
-
-    var bpx = px - bx, bpy = py - by, bpz = pz - bz;
-    var d3 = abx * bpx + aby * bpy + abz * bpz;
-    var d4 = acx * bpx + acy * bpy + acz * bpz;
-    if (d3 >= 0 && d4 <= d3) return { x: bx, y: by, z: bz };
-
-    var vc = d1 * d4 - d3 * d2;
-    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
-      var v1 = d1 / (d1 - d3);
-      return { x: ax + abx * v1, y: ay + aby * v1, z: az + abz * v1 };
-    }
-
-    var cpx = px - cx, cpy = py - cy, cpz = pz - cz;
-    var d5 = abx * cpx + aby * cpy + abz * cpz;
-    var d6 = acx * cpx + acy * cpy + acz * cpz;
-    if (d6 >= 0 && d5 <= d6) return { x: cx, y: cy, z: cz };
-
-    var vb = d5 * d2 - d1 * d6;
-    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
-      var w1 = d2 / (d2 - d6);
-      return { x: ax + acx * w1, y: ay + acy * w1, z: az + acz * w1 };
-    }
-
-    var va = d3 * d6 - d5 * d4;
-    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
-      var w2 = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-      return { x: bx + (cx - bx) * w2, y: by + (cy - by) * w2, z: bz + (cz - bz) * w2 };
-    }
-
-    var denom = 1 / (va + vb + vc);
-    var v = vb * denom, w = vc * denom;
-    return { x: ax + abx * v + acx * w, y: ay + aby * v + acy * w, z: az + abz * v + acz * w };
-  }
-
   // shared: split velocity into normal/tangential, kill normal (no bounce),
   // damp tangential (lets cloth slide/slump off instead of sticking)
   Cloth.prototype._dampTangential = function (pxI, pyI, pzI, nx, ny, nz, friction) {
@@ -1018,7 +442,7 @@
 
   Cloth.prototype._resolveBox = function (p, col) {
     var pos = this.pos, prev = this.prev;
-    var skin = COLLISION_SKIN;
+    var skin = 0.06;
     var friction = this.collisionFriction;
 
     var pxI = p * 3, pyI = pxI + 1, pzI = pxI + 2;
@@ -1031,41 +455,21 @@
 
     var hx = half.x + skin, hy = half.y + skin, hz = half.z + skin;
 
-    // FIX (tunneling with fast-moving colliders): the swept test below
-    // only ever accounted for how far the CLOTH POINT moved between
-    // prev/pos. A collider that itself moves fast (e.g. a block swept
-    // back and forth every frame) can displace by more than its own
-    // half-width in one step — the point can end up "outside" the box
-    // at both the old and new collider position, so the point-only
-    // swept test never sees a crossing at all and cloth clips straight
-    // through. Track each collider's own previous-frame position (set
-    // once via _prevPos, keyed by the collider object itself) and fold
-    // that displacement into the effective half-extents used for the
-    // swept test, so a fast-moving box is also covered, not just a
-    // fast-moving point. This only affects the SWEPT test region — the
-    // final resting push-out below still uses the true hx/hy/hz.
-    if (!col._prevPos) col._prevPos = { x: cx, y: cy, z: cz };
-    var colDx = cx - col._prevPos.x, colDy = cy - col._prevPos.y, colDz = cz - col._prevPos.z;
-    var shx = hx + Math.abs(colDx), shy = hy + Math.abs(colDy), shz = hz + Math.abs(colDz);
-    col._prevPos.x = cx; col._prevPos.y = cy; col._prevPos.z = cz;
-
     var lx = px - cx, ly = py - cy, lz = pz - cz;
     var inside = Math.abs(lx) < hx && Math.abs(ly) < hy && Math.abs(lz) < hz;
 
     // if not resolved as "inside" this frame, still check whether the
-    // point tunneled straight through the box between prev and pos —
-    // OR the box tunneled through the point, now covered by the
-    // expanded shx/shy/shz above. (Fast wind/gravity/collider motion
-    // can skip a thin box entirely in one step, or skin-boundary
-    // rounding can leave a point sitting exactly on the edge.) Always
-    // run a swept AABB test against the prev->pos segment rather than
-    // gating on a "was outside" check, since that boundary comparison
-    // is float-precision-fragile.
+    // point tunneled straight through the box between prev and pos
+    // (fast wind/gravity/collider motion can skip a thin box entirely
+    // in one step, or skin-boundary rounding can leave a point sitting
+    // exactly on the edge). Always run a swept AABB test against the
+    // prev->pos segment rather than gating on a "was outside" check,
+    // since that boundary comparison is float-precision-fragile.
     if (!inside) {
       var plx = ppx - cx, ply = ppy - cy, plz = ppz - cz;
       var dx = px - ppx, dy = py - ppy, dz = pz - ppz;
       var tmin = 0, tmax = 1;
-      var axes = [[plx, dx, shx], [ply, dy, shy], [plz, dz, shz]];
+      var axes = [[plx, dx, hx], [ply, dy, hy], [plz, dz, hz]];
       var hit = true;
       for (var ai = 0; ai < 3; ai++) {
         var o = axes[ai][0], d = axes[ai][1], h = axes[ai][2];
@@ -1120,20 +524,11 @@
 
     var nx = 0, ny = 0, nz = 0;
     if (nearCorner) {
-      // clamp to the box SURFACE point closest to the cloth point, then
-      // push out along that direction — correct at edges/corners.
-      // NOTE: lx/ly/lz are already inside [-h,h] here (inside === true).
-      // Only the axes actually part of the near-tie (small penetration
-      // depth) should snap to their face; an axis NOT in the tie keeps
-      // its own coordinate (a true no-op clamp), since it isn't near
-      // its wall and shouldn't be pulled toward it — that's what makes
-      // this correct for 2-axis edges as well as 3-axis corners.
-      var xClose = ox - minO < minO * 0.35;
-      var yClose = oy - minO < minO * 0.35;
-      var zClose = oz - minO < minO * 0.35;
-      var cxp = xClose ? (lx < 0 ? -hx : hx) : lx;
-      var cyp = yClose ? (ly < 0 ? -hy : hy) : ly;
-      var czp = zClose ? (lz < 0 ? -hz : hz) : lz;
+      // clamp to the box surface point closest to the cloth point,
+      // then push out along that direction — correct at edges/corners
+      var cxp = Math.max(-hx, Math.min(hx, lx));
+      var cyp = Math.max(-hy, Math.min(hy, ly));
+      var czp = Math.max(-hz, Math.min(hz, lz));
       var ddx = lx - cxp, ddy = ly - cyp, ddz = lz - czp;
       var dlen = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
       if (dlen < 1e-6) {
@@ -1322,15 +717,8 @@
       for (var xx = 0; xx < cloth.cols - 1; xx++) {
         var a = cloth.idx(xx, yy), b = cloth.idx(xx + 1, yy),
             c = cloth.idx(xx, yy + 1), d = cloth.idx(xx + 1, yy + 1);
-        // skip a triangle if any corner it touches is outside a custom
-        // shape's outline — otherwise a non-rectangular shape (disc,
-        // star, custom model surface) would still render as a filled
-        // rectangle, with the "outside" cells just sitting pinned at the
-        // origin instead of being invisible like they should be
-        var aOK = cloth.cellActive(xx, yy), bOK = cloth.cellActive(xx + 1, yy),
-            cOK = cloth.cellActive(xx, yy + 1), dOK = cloth.cellActive(xx + 1, yy + 1);
-        if (aOK && cOK && bOK) indices.push(a, c, b);
-        if (bOK && cOK && dOK) indices.push(b, c, d);
+        indices.push(a, c, b);
+        indices.push(b, c, d);
       }
     }
 
@@ -1370,11 +758,7 @@
       tearSensitivity: opts.tearSensitivity,
       shear: opts.shear,
       pin: opts.pin != null ? opts.pin : 'top',
-      pinEvery: opts.pinEvery,
-      selfCollision: opts.selfCollision,
-      crossCollision: opts.crossCollision,
-      thickness: opts.thickness,
-      shape: opts.shape
+      pinEvery: opts.pinEvery
     });
 
     // smooth: N (integer >= 2) renders a Catmull-Rom-interpolated mesh
@@ -1383,13 +767,7 @@
     // Defaults ON at 3x so cloth looks smooth even if the caller
     // doesn't pass the option. Pass smooth: false or smooth: 1 to
     // render at raw physics-grid resolution instead.
-    // Catmull-Rom smoothing (buildSmoothGeometry) interpolates across
-    // the FULL rectangular grid — it has no concept of "inactive" cells,
-    // so a custom shape's cut-out outline would get smeared back into a
-    // filled rectangle. Force it off for shaped cloth regardless of what
-    // was requested; pass a denser cols/rows grid instead if you need a
-    // smoother-looking custom shape.
-    this.smoothFactor = (opts.smooth === false || opts.smooth === 1 || this.cloth.active)
+    this.smoothFactor = (opts.smooth === false || opts.smooth === 1)
       ? 0
       : Math.floor(opts.smooth && opts.smooth > 1 ? opts.smooth : 3);
     this.geometry = this.smoothFactor
@@ -1429,109 +807,15 @@
     // not here: light.shadow.bias = -0.002 (and/or
     // light.shadow.normalBias = 0.02) typically clears it up.
 
-    // ---- optional frustum culling: skip physics + mesh sync entirely
-    // when the cloth isn't in view. Off by default — opt in by passing
-    // a THREE.Camera as `cullCamera`. See update() below for how the
-    // actual skip decision is made each frame.
-    this.cullCamera = opts.cullCamera || null;
-    this._frustum = new THREE.Frustum();
-    this._frustumMatrix = new THREE.Matrix4();
-    this._boundingSphere = new THREE.Sphere();
-    this._computeBoundingSphere();
-    this._wasInView = true; // assume visible on the first frame
-
     syncMeshGeometry(this.cloth, this.mesh);
   }
-
-  /** Recompute the cloth's world-space bounding sphere from its current
-   *  point positions. Called once at construction; call again yourself
-   *  (tatterMesh._computeBoundingSphere()) if the cloth's overall extent
-   *  changes drastically at runtime (e.g. you reposition its origin far
-   *  from where it started) so culling stays accurate. Ordinary drape/
-   *  wind motion does NOT require this — the sphere is padded generously
-   *  on purpose so normal movement stays inside it. */
-  TatterMesh.prototype._computeBoundingSphere = function () {
-    var pos = this.cloth.pos;
-    var active = this.cloth.active; // null for a plain rectangular cloth
-    var n = this.cloth.cols * this.cloth.rows;
-    var minX = Infinity, minY = Infinity, minZ = Infinity;
-    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-    for (var i = 0; i < n; i++) {
-      // custom-shape cloth parks inactive (outside the shape) points at
-      // the grid origin permanently — skip them here so a sparse shape
-      // (e.g. a thin star or ring) doesn't get its culling volume
-      // dragged out to include that origin point unnecessarily
-      if (active && !active[i]) continue;
-      var ix = i * 3;
-      var x = pos[ix], y = pos[ix + 1], z = pos[ix + 2];
-      if (x < minX) minX = x; if (x > maxX) maxX = x;
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
-    }
-    var cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
-    var dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
-    var radius = Math.sqrt(dx * dx + dy * dy + dz * dz) / 2;
-    // pad generously: cloth moves (drape, wind, pin animation) after this
-    // is computed, and the sphere isn't recomputed every frame (that
-    // would defeat the point of culling — recomputing needs the same
-    // point-position pass the physics step already does). The pad keeps
-    // normal motion from drifting the cloth outside its own culling
-    // volume and popping in and out incorrectly.
-    this._boundingSphere.center.set(cx, cy, cz);
-    this._boundingSphere.radius = Math.max(radius, this.cloth.spacing) * 1.5 + 1;
-  };
 
   /** Advance physics and sync the mesh geometry. Call once per frame.
    *  Set tatter.meshSkip = N to throttle the expensive smoothing/normals
    *  resync to every Nth call (physics itself still steps every call).
    *  Default 1 (every frame).
-   *
-   *  If cullCamera was passed at construction (or set directly via
-   *  tatterMesh.cullCamera = camera), this checks the cloth's bounding
-   *  sphere against that camera's view frustum first. When the cloth is
-   *  fully outside the frustum, BOTH the physics step and the mesh sync
-   *  are skipped entirely for this call — the point array is left
-   *  exactly as it was. This is a real cost saving (not just a visual
-   *  one) for scenes with several off-screen cloths, at the cost of
-   *  cloth motion "freezing" while off-screen and resuming, rather than
-   *  continuing to simulate silently, once it re-enters view. That's
-   *  usually the right tradeoff (why pay for wind/collision on a flag
-   *  behind the player's back?), but if you need cloth to keep animating
-   *  off-screen (e.g. it's about to swing into view on a predictable
-   *  path), don't set cullCamera and rely on meshSkip/collisionIterations
-   *  instead for perf.
    */
   TatterMesh.prototype.update = function (colliders, wind) {
-    if (this.cullCamera) {
-      // NOTE: matrixWorldInverse is only correct if the camera's world
-      // matrix has been updated THIS frame. That normally happens
-      // inside renderer.render(), which typically runs AFTER
-      // tatterMesh.update() in a standard animate loop — meaning by
-      // default this would check against last frame's camera transform
-      // (fine for a static camera, one frame stale for a moving one).
-      // If your camera moves and you see culling lag by a frame,
-      // call cullCamera.updateMatrixWorld() yourself right before this.
-      this.cullCamera.updateMatrixWorld();
-      this._frustumMatrix.multiplyMatrices(
-        this.cullCamera.projectionMatrix,
-        this.cullCamera.matrixWorldInverse
-      );
-      this._frustum.setFromProjectionMatrix(this._frustumMatrix);
-      var inView = this._frustum.intersectsSphere(this._boundingSphere);
-      if (!inView) {
-        this._wasInView = false;
-        return this; // skip physics + mesh sync entirely this frame
-      }
-      if (!this._wasInView) {
-        // re-entering view after being culled: prev/pos can be far
-        // apart if a lot of real time passed off-screen (nothing was
-        // stepping prev toward pos), which would otherwise show up as
-        // a sudden velocity kick on the first visible frame. Snap prev
-        // to pos once so the cloth resumes calmly instead of lurching.
-        this.cloth.prev.set(this.cloth.pos);
-        this._wasInView = true;
-      }
-    }
     this.cloth.step(colliders, wind, this._floorY);
     syncMeshGeometry(this.cloth, this.mesh, this.meshSkip || 1);
     return this;
@@ -1577,7 +861,6 @@
   };
 
   TatterMesh.prototype.dispose = function () {
-    this.cloth.disposeCloth();
     this.geometry.dispose();
     if (this.material && this.material.dispose) this.material.dispose();
   };
@@ -1616,309 +899,6 @@
     var h = (params.height != null ? params.height : 1) * mesh.scale.y;
     return { type: 'cone', pos: mesh.position, radius: r, height: h };
   }
-
-  /** Convenience: build a { pointA, pointB, radius } collider from a
-   *  THREE.Mesh with CapsuleGeometry (upright, Y-axis; matches THREE's
-   *  own capsule orientation). If your THREE version lacks
-   *  CapsuleGeometry, or the capsule is oriented some other way, build
-   *  the collider object by hand instead: { type:'capsule',
-   *  pointA:{x,y,z}, pointB:{x,y,z}, radius }. */
-  function capsuleCollider(mesh) {
-    var params = mesh.geometry.parameters || {};
-    var r = (params.radius != null ? params.radius : 0.5) * mesh.scale.x;
-    var halfLine = ((params.length != null ? params.length : 1) / 2) * mesh.scale.y;
-    var pos = mesh.position;
-    return {
-      type: 'capsule',
-      pointA: { x: pos.x, y: pos.y - halfLine, z: pos.z },
-      pointB: { x: pos.x, y: pos.y + halfLine, z: pos.z },
-      radius: r
-    };
-  }
-
-  /** Build a { pos, normal } infinite-plane collider from a THREE.Mesh
-   *  (uses the mesh's position and its local +Y axis rotated by its
-   *  current orientation as the plane normal — the natural choice for a
-   *  PlaneGeometry, which faces +Z, or any mesh you've oriented by hand). */
-  function planeCollider(mesh, normal) {
-    var n = normal || { x: 0, y: 1, z: 0 };
-    if (mesh.quaternion) {
-      var THREE = mesh.constructor && mesh.constructor.name ? null : null; // no THREE dependency needed here
-      var q = mesh.quaternion;
-      // rotate n by mesh quaternion manually (avoids requiring a THREE.Vector3 import in this helper)
-      var x = n.x, y = n.y, z = n.z;
-      var qx = q.x, qy = q.y, qz = q.z, qw = q.w;
-      var ix = qw * x + qy * z - qz * y;
-      var iy = qw * y + qz * x - qx * z;
-      var iz = qw * z + qx * y - qy * x;
-      var iw = -qx * x - qy * y - qz * z;
-      n = {
-        x: ix * qw + iw * -qx + iy * -qz - iz * -qy,
-        y: iy * qw + iw * -qy + iz * -qx - ix * -qz,
-        z: iz * qw + iw * -qz + ix * -qy - iy * -qx
-      };
-    }
-    return { type: 'plane', pos: mesh.position, normal: n };
-  }
-
-  /** Build a { type:'mesh' } collider from ANY THREE.Mesh — a custom
-   *  model, a loaded GLTF, a capsule/torus/whatever primitive THREE
-   *  ships that isn't box/sphere/cylinder/cone, or hand-authored
-   *  BufferGeometry. This is the "custom shapes and models" collider:
-   *  cloth will drape and collide against the mesh's actual triangle
-   *  surface, not an approximation.
-   *
-   *  Cost note: this bakes the mesh's WORLD-SPACE triangles into a
-   *  spatial hash once, here, not every frame — so it's cheap to collide
-   *  against repeatedly but the bake itself (O(triangle count)) is
-   *  comparatively expensive for a very dense mesh. For a static model,
-   *  call this once. For a model that moves/rotates/scales at runtime,
-   *  call refreshMeshCollider(collider, mesh) after moving it (see below)
-   *  rather than rebuilding a new collider from scratch each frame.
-   *
-   *  opts.maxTriangles caps how many triangles are used (default 5000) —
-   *  denser source meshes are randomly subsampled with a fixed seed so
-   *  the result is deterministic across calls. High-poly collision
-   *  meshes rarely help visually (skin margin already smooths over
-   *  small-scale detail) and directly cost frame time, so simplify your
-   *  source geometry (e.g. a decimated collision proxy) rather than
-   *  relying on this cap for anything but a safety ceiling.
-   */
-  function meshCollider(mesh, opts) {
-    opts = opts || {};
-    var col = { type: 'mesh', enabled: opts.enabled !== false };
-    refreshMeshCollider(col, mesh, opts.maxTriangles || 5000);
-    return col;
-  }
-
-  /** Re-bake a mesh collider's world-space triangles and spatial hash
-   *  from its source THREE.Mesh's CURRENT transform. Call this after
-   *  moving, rotating, or scaling a mesh you built a collider from with
-   *  meshCollider() — the collider does not track the mesh live on its
-   *  own, since re-baking every point every frame would be far more
-   *  expensive than the primitives above for no benefit on mostly-static
-   *  set dressing. For a mesh that moves every frame, call this once per
-   *  frame (it's still much cheaper than rebuilding from scratch, since
-   *  it reuses the same triangle-index sampling). */
-  function refreshMeshCollider(col, mesh, maxTriangles) {
-    var geo = mesh.geometry;
-    if (!geo.attributes || !geo.attributes.position) {
-      throw new Error('Tatter.js: meshCollider requires geometry with a position attribute.');
-    }
-    mesh.updateMatrixWorld(true);
-    var m = mesh.matrixWorld;
-    var posAttr = geo.attributes.position;
-    var indexAttr = geo.index;
-    var triCount = indexAttr ? indexAttr.count / 3 : posAttr.count / 3;
-
-    maxTriangles = maxTriangles || 5000;
-    var stride = triCount > maxTriangles ? Math.ceil(triCount / maxTriangles) : 1;
-
-    function vertexAt(i) {
-      var vi = indexAttr ? indexAttr.getX(i) : i;
-      var x = posAttr.getX(vi), y = posAttr.getY(vi), z = posAttr.getZ(vi);
-      // transform to world space using the mesh's current matrix, so the
-      // baked collider matches wherever the mesh actually is/was posed
-      var wx = m.elements[0] * x + m.elements[4] * y + m.elements[8] * z + m.elements[12];
-      var wy = m.elements[1] * x + m.elements[5] * y + m.elements[9] * z + m.elements[13];
-      var wz = m.elements[2] * x + m.elements[6] * y + m.elements[10] * z + m.elements[14];
-      return { x: wx, y: wy, z: wz };
-    }
-
-    var cell = 0, cellSamples = 0;
-    var triangles = [];
-    var minX = Infinity, minY = Infinity, minZ = Infinity;
-    var maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-    for (var t = 0; t < triCount; t += stride) {
-      var a = vertexAt(t * 3), b = vertexAt(t * 3 + 1), c = vertexAt(t * 3 + 2);
-      var abx = b.x - a.x, aby = b.y - a.y, abz = b.z - a.z;
-      var acx = c.x - a.x, acy = c.y - a.y, acz = c.z - a.z;
-      // face normal via cross product; degenerate (zero-area) triangles
-      // are skipped so they can't produce a NaN/garbage normal that
-      // would otherwise poison the nearest-triangle search
-      var nx = aby * acz - abz * acy;
-      var ny = abz * acx - abx * acz;
-      var nz = abx * acy - aby * acx;
-      var nlen = Math.sqrt(nx * nx + ny * ny + nz * nz);
-      if (nlen < 1e-10) continue;
-      nx /= nlen; ny /= nlen; nz /= nlen;
-
-      triangles.push({
-        ax: a.x, ay: a.y, az: a.z,
-        bx: b.x, by: b.y, bz: b.z,
-        cx: c.x, cy: c.y, cz: c.z,
-        nx: nx, ny: ny, nz: nz
-      });
-
-      var edgeLen = Math.sqrt(abx * abx + aby * aby + abz * abz);
-      if (edgeLen > 0) { cell += edgeLen; cellSamples++; }
-      minX = Math.min(minX, a.x, b.x, c.x); maxX = Math.max(maxX, a.x, b.x, c.x);
-      minY = Math.min(minY, a.y, b.y, c.y); maxY = Math.max(maxY, a.y, b.y, c.y);
-      minZ = Math.min(minZ, a.z, b.z, c.z); maxZ = Math.max(maxZ, a.z, b.z, c.z);
-    }
-
-    // hash cell size ~= average triangle edge length, clamped to a sane
-    // range — this is the same "bucket by natural scale" idea the
-    // self-collision spatial hash already uses (see _buildSpatialHash)
-    var avgEdge = cellSamples ? cell / cellSamples : 1;
-    var hashCell = Math.max(avgEdge * 1.5, 0.05);
-
-    var hash = {};
-    for (var ti = 0; ti < triangles.length; ti++) {
-      var tri = triangles[ti];
-      var tcx = (tri.ax + tri.bx + tri.cx) / 3;
-      var tcy = (tri.ay + tri.by + tri.cy) / 3;
-      var tcz = (tri.az + tri.bz + tri.cz) / 3;
-      var kx = Math.floor(tcx / hashCell), ky = Math.floor(tcy / hashCell), kz = Math.floor(tcz / hashCell);
-      var key = kx + ',' + ky + ',' + kz;
-      (hash[key] || (hash[key] = [])).push(tri);
-    }
-
-    col.triangles = triangles;
-    col._hash = hash;
-    col._hashCell = hashCell;
-    col.bounds = { min: { x: minX, y: minY, z: minZ }, max: { x: maxX, y: maxY, z: maxZ } };
-    return col;
-  }
-
-  // ---- ready-made `shape` functions for Tatter.cloth({ shape: ... }) ----
-  // Each returns a function(x, y, cols, rows) -> {x,y,z}|null suitable for
-  // the Cloth `shape` option, so the simulated grid takes on a
-  // non-rectangular outline instead of the default flat rectangle.
-  var shapes = {
-    /** Flat circular/elliptical disc lying in the XZ plane. radius (or
-     *  radiusX/radiusZ for an ellipse) in world units, centered on origin. */
-    circle: function (opts) {
-      opts = opts || {};
-      var rx = opts.radiusX != null ? opts.radiusX : (opts.radius != null ? opts.radius : 2);
-      var rz = opts.radiusZ != null ? opts.radiusZ : (opts.radius != null ? opts.radius : 2);
-      var origin = opts.origin || { x: 0, y: 0, z: 0 };
-      return function (x, y, cols, rows) {
-        var u = (x / (cols - 1)) * 2 - 1; // -1..1
-        var v = (y / (rows - 1)) * 2 - 1;
-        if (u * u + v * v > 1) return null;
-        return { x: origin.x + u * rx, y: origin.y, z: origin.z + v * rz };
-      };
-    },
-    /** Flat annulus/ring (disc with a hole) in the XZ plane. innerRadius
-     *  and outerRadius as a fraction of the grid's half-extent (0-1). */
-    ring: function (opts) {
-      opts = opts || {};
-      var outerR = opts.outerRadius != null ? opts.outerRadius : 2;
-      var innerFrac = opts.innerRadius != null ? opts.innerRadius / outerR : 0.4;
-      var origin = opts.origin || { x: 0, y: 0, z: 0 };
-      return function (x, y, cols, rows) {
-        var u = (x / (cols - 1)) * 2 - 1;
-        var v = (y / (rows - 1)) * 2 - 1;
-        var d = Math.sqrt(u * u + v * v);
-        if (d > 1 || d < innerFrac) return null;
-        return { x: origin.x + u * outerR, y: origin.y, z: origin.z + v * outerR };
-      };
-    },
-    /** Flat shape from an arbitrary polygon outline (array of {x,z}
-     *  points, e.g. a star, a logo silhouette, anything) — grid cells
-     *  whose (u,v) position falls outside the polygon are dropped. Uses
-     *  standard even-odd ray casting for point-in-polygon. The polygon
-     *  is expected in the same -1..1 normalized space the grid maps to;
-     *  pass `scale` to size it up to world units. */
-    polygon: function (opts) {
-      opts = opts || {};
-      var pts = opts.points;
-      if (!pts || pts.length < 3) {
-        throw new Error('Tatter.js: shapes.polygon requires opts.points, an array of 3+ {x,z} pairs.');
-      }
-      var scale = opts.scale != null ? opts.scale : 2;
-      var origin = opts.origin || { x: 0, y: 0, z: 0 };
-      function pointInPolygon(px, pz) {
-        var inside = false;
-        for (var i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-          var xi = pts[i].x, zi = pts[i].z, xj = pts[j].x, zj = pts[j].z;
-          var intersects = ((zi > pz) !== (zj > pz)) &&
-            (px < (xj - xi) * (pz - zi) / (zj - zi) + xi);
-          if (intersects) inside = !inside;
-        }
-        return inside;
-      }
-      return function (x, y, cols, rows) {
-        var u = (x / (cols - 1)) * 2 - 1;
-        var v = (y / (rows - 1)) * 2 - 1;
-        if (!pointInPolygon(u, v)) return null;
-        return { x: origin.x + u * scale, y: origin.y, z: origin.z + v * scale };
-      };
-    }
-  };
-
-  /** Build a shape function that samples a custom THREE.Mesh/model's
-   *  actual surface, for draping cloth over (or generating cloth IN THE
-   *  SHAPE of) an arbitrary model — a cape conforming to a character's
-   *  shoulders, a tarp over irregular terrain, a flag that starts flush
-   *  against a custom flagpole cap, etc.
-   *
-   *  How it works: casts rays straight down (-Y, in the mesh's local
-   *  space) from a height above the mesh's bounding box at each grid
-   *  (x,y) cell, using THREE.Raycaster against the mesh's geometry, and
-   *  places that grid point at the hit (offset outward along the hit
-   *  normal by `opts.offset`, default a small gap so the cloth starts
-   *  just above the surface rather than exactly on it, which would
-   *  immediately register as a collision if you also pass this same mesh
-   *  as a collider). Cells that don't hit the surface are left inactive
-   *  (null) — so a non-convex/irregular model naturally produces a
-   *  cloth outline matching its silhouette from above, same idea as
-   *  shapes.polygon but derived from a real 3D surface instead of a
-   *  hand-authored outline.
-   *
-   *  This only works for surfaces where "drop a point straight down onto
-   *  it" makes sense (roughly convex-from-above, like terrain, a table,
-   *  a character's back/shoulders) — for wrap-around draping over a
-   *  fully enclosed shape, use meshCollider() as a collider instead and
-   *  let a normal flat cloth fall onto and settle around it dynamically,
-   *  which handles arbitrary topology correctly since it's real physics
-   *  rather than a one-shot projection.
-   */
-  function shapeFromMesh(mesh, opts) {
-    opts = opts || {};
-    var THREE = resolveThree(opts.THREE);
-    mesh.updateMatrixWorld(true);
-    var box = new THREE.Box3().setFromObject(mesh);
-    var offset = opts.offset != null ? opts.offset : 0.05;
-    var rayHeight = box.max.y - box.min.y + 1;
-    var raycaster = new THREE.Raycaster();
-    var down = new THREE.Vector3(0, -1, 0);
-
-    return function (x, y, cols, rows) {
-      var u = x / (cols - 1); // 0..1
-      var v = y / (rows - 1);
-      var wx = box.min.x + u * (box.max.x - box.min.x);
-      var wz = box.min.z + v * (box.max.z - box.min.z);
-      raycaster.set(new THREE.Vector3(wx, box.max.y + rayHeight, wz), down);
-      var hits = raycaster.intersectObject(mesh, false);
-      if (!hits.length) return null;
-      var hit = hits[0];
-      return {
-        x: hit.point.x + (hit.face ? hit.face.normal.x * offset : 0),
-        y: hit.point.y + (hit.face ? hit.face.normal.y * offset : offset),
-        z: hit.point.z + (hit.face ? hit.face.normal.z * offset : 0)
-      };
-    };
-  }
-
-  /** Build a TatterMesh whose shape/topology is derived from a custom
-   *  THREE.Mesh/model, via shapeFromMesh() above — the "drape cloth over
-   *  a custom model" entry point. All other TatterMesh options (material,
-   *  pin, wind, etc) still apply; this just supplies `shape` for you.
-   *  For "cloth collides against a custom model" (the more common case —
-   *  a flag near a statue, a cape brushing past a shoulder) use
-   *  Tatter.meshCollider(mesh) as a normal collider instead; use this
-   *  only when you want the cloth's resting shape itself to start
-   *  conformed to the model's surface. */
-  TatterMesh.fromMesh = function (source, opts) {
-    opts = opts || {};
-    var shapeOpts = { THREE: opts.THREE, offset: opts.offset };
-    var built = Object.create(opts);
-    built.shape = shapeFromMesh(source, shapeOpts);
-    return new TatterMesh(built);
-  };
 
   /**
    * Turbulent air wind helper — call once per frame with a running time
@@ -1969,12 +949,6 @@
     sphereCollider: sphereCollider,
     cylinderCollider: cylinderCollider,
     coneCollider: coneCollider,
-    capsuleCollider: capsuleCollider,
-    planeCollider: planeCollider,
-    meshCollider: meshCollider,
-    refreshMeshCollider: refreshMeshCollider,
-    shapes: shapes,
-    fromMesh: function (source, opts) { return TatterMesh.fromMesh(source, opts); },
     wind: wind
   };
 });
